@@ -1,0 +1,79 @@
+{
+  "kernel": "cutlass_sm90_warpspec_cooperative_gemm",
+  "framework": "cutlass",
+  "arch": "sm_90a",
+  "notes": "CUTLASS 3.x warp-specialized cooperative GEMM (KernelTmaWarpSpecializedCooperative). 1 producer WG + 2 consumer WGs. CUTLASS manually uses C++ union to overlap mainloop pipeline buffers with epilogue output buffer. Our HB analysis can verify this overlap is safe AND detect additional opportunities.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_wait_empty",
+          "signal_in": "empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P1_load_AB",
+          "signal_in": null,
+          "signal_out": "full",
+          "buffers": ["smem_A", "smem_B"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer_0",
+      "phases": [
+        {
+          "label": "C0_0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_0_mma",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "C2_0_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_C"]
+        }
+      ]
+    },
+    {
+      "wg_id": 2,
+      "role": "consumer_1",
+      "phases": [
+        {
+          "label": "C0_1_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_1_mma",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "C2_1_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_C"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "smem_A": {"size_bytes": 32768, "description": "A tile [128x64 f16, 2 stages]"},
+    "smem_B": {"size_bytes": 49152, "description": "B tile [64x192 f16, 2 stages]"},
+    "smem_C": {"size_bytes": 49152, "description": "Output tile [128x192 f16], CUTLASS overlaps this with pipeline via union"}
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "kernel": "matmul_f16_ws_1p3c",
+  "framework": "choreo",
+  "arch": "sm_90a",
+  "notes": "Warp-specialized 1P3C GEMM. 1 producer (WG0) + 3 consumers (WG1-3). All consumers share the pipeline buffers. WITHOUT a CTA barrier before epilogue, the three consumer epilogue phases are NOT HB-ordered w.r.t. each other's MMA phases, making pipeline-output overlap unsafe. This pattern models the NO-BARRIER case.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_wait_empty",
+          "signal_in": "empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P1_load_tiles",
+          "signal_in": null,
+          "signal_out": "full",
+          "buffers": ["lhs_s", "rhs_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer_0",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_mma",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["lhs_s", "rhs_s"]
+        },
+        {
+          "label": "C2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["output_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 2,
+      "role": "consumer_1",
+      "phases": [
+        {
+          "label": "D0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "D1_mma",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["lhs_s", "rhs_s"]
+        },
+        {
+          "label": "D2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["output_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 3,
+      "role": "consumer_2",
+      "phases": [
+        {
+          "label": "E0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "E1_mma",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["lhs_s", "rhs_s"]
+        },
+        {
+          "label": "E2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["output_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "lhs_s": {"size_bytes": 32768, "description": "LHS tile [128x64 f16, 2 stages]"},
+    "rhs_s": {"size_bytes": 49152, "description": "RHS tile [64x192 f16, 2 stages]"},
+    "output_s": {"size_bytes": 49152, "description": "Output tile [128x192 f16]"}
+  }
+}

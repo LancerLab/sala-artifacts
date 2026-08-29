@@ -1,0 +1,16 @@
+--- a/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp
++++ b/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp
+@@ -176,8 +176,11 @@
+       using MainloopTensorStorage = typename CollectiveMainloop::TensorStorage;
+       using EpilogueTensorStorage = typename CollectiveEpilogue::TensorStorage;
+ 
+-      EpilogueTensorStorage epilogue;
+-      MainloopTensorStorage mainloop;
++      // SALA: overlap phase-disjoint mainloop/epilogue buffers (struct -> union)
++      union {
++        EpilogueTensorStorage epilogue;
++        MainloopTensorStorage mainloop;
++      };
+     } tensors;
+   };
+ 

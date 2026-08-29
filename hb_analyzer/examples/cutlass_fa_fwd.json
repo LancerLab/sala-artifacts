@@ -1,0 +1,68 @@
+{
+  "kernel": "cutlass_fmha_forward_sm90",
+  "framework": "cutlass",
+  "arch": "sm_90a",
+  "notes": "CUTLASS 3.x Flash Attention forward (from examples/41_fused_multi_head_attention). CUTLASS FA uses TMA for K/V loading with warp specialization. Q is loaded to registers or smem once. K/V share a single pipeline (loaded sequentially within each iteration). CUTLASS does NOT overlap K and V buffers — they are allocated separately in SMEM. Our HB analysis can detect this opportunity.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_load_Q",
+          "signal_in": null,
+          "signal_out": "q_ready",
+          "buffers": ["Q_s"]
+        },
+        {
+          "label": "P1_wait_kv_empty",
+          "signal_in": "kv_empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P2_load_KV",
+          "signal_in": null,
+          "signal_out": "kv_full",
+          "buffers": ["K_s", "V_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "kv_empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_wait_Q",
+          "signal_in": "q_ready",
+          "signal_out": null,
+          "buffers": ["Q_s"]
+        },
+        {
+          "label": "C2_qkt_pv",
+          "signal_in": "kv_full",
+          "signal_out": "kv_empty",
+          "buffers": ["Q_s", "K_s", "V_s"]
+        },
+        {
+          "label": "C3_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["O_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "Q_s": {"size_bytes": 16384, "description": "Q tile [BR x HD, f16]"},
+    "K_s": {"size_bytes": 16384, "description": "K tile [BN x HD, f16, 2 stages]"},
+    "V_s": {"size_bytes": 16384, "description": "V tile [BN x HD, f16, 2 stages]"},
+    "O_s": {"size_bytes": 16384, "description": "Output tile [BR x HD, f16]"}
+  }
+}

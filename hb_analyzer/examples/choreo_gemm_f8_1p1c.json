@@ -1,0 +1,55 @@
+{
+  "kernel": "matmul_e4m3_ws_1p1c",
+  "framework": "choreo",
+  "arch": "sm_90a",
+  "notes": "FP8 (e4m3) warp-specialized 1P1C GEMM. FP8 tiles are half the size of f16, but the output remains f16/f32, creating a large size differential between pipeline and output buffers. This is where HB overlap saves the most — the output buffer is much larger than a pipeline stage buffer.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_wait_empty",
+          "signal_in": "empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P1_load_tiles",
+          "signal_in": null,
+          "signal_out": "full",
+          "buffers": ["lhs_s", "rhs_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_compute",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["lhs_s", "rhs_s"]
+        },
+        {
+          "label": "C2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["output_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "lhs_s": {"size_bytes": 16384, "description": "LHS tile [128x64 e4m3, 2 stages] — half the size of f16"},
+    "rhs_s": {"size_bytes": 24576, "description": "RHS tile [64x192 e4m3, 2 stages]"},
+    "output_s": {"size_bytes": 98304, "description": "Output tile [128x192 f16] + block scaling factors"}
+  }
+}

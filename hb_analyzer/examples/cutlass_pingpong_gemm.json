@@ -1,0 +1,79 @@
+{
+  "kernel": "cutlass_sm90_warpspec_pingpong_gemm",
+  "framework": "cutlass",
+  "arch": "sm_90a",
+  "notes": "CUTLASS 3.x ping-pong warp-specialized GEMM (KernelTmaWarpSpecializedPingpong). 1 producer WG + 2 consumer WGs that alternate: while C0 does MMA on stage S, C1 does epilogue on stage S-1 (and vice versa). CUTLASS uses manual unions. The ping-pong pattern creates tighter signal ordering, offering more overlap potential than cooperative.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_wait_empty",
+          "signal_in": "empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P1_load_AB",
+          "signal_in": null,
+          "signal_out": "full",
+          "buffers": ["smem_A", "smem_B"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer_0_pingpong",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_mma_even",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "C2_epilogue_even",
+          "signal_in": "epi_done_1",
+          "signal_out": "epi_done_0",
+          "buffers": ["smem_C"]
+        }
+      ]
+    },
+    {
+      "wg_id": 2,
+      "role": "consumer_1_pingpong",
+      "phases": [
+        {
+          "label": "D0_init",
+          "signal_in": null,
+          "signal_out": "empty",
+          "buffers": []
+        },
+        {
+          "label": "D1_mma_odd",
+          "signal_in": "full",
+          "signal_out": "empty",
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "D2_epilogue_odd",
+          "signal_in": "epi_done_0",
+          "signal_out": "epi_done_1",
+          "buffers": ["smem_C"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "smem_A": {"size_bytes": 32768, "description": "A tile [128x64 f16, 2 stages]"},
+    "smem_B": {"size_bytes": 49152, "description": "B tile [64x192 f16, 2 stages]"},
+    "smem_C": {"size_bytes": 49152, "description": "Output tile [128x192 f16]"}
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "kernel": "tilelang_gemm_sm90",
+  "framework": "tilelang",
+  "arch": "sm_90a",
+  "notes": "TileLang GEMM kernel. TileLang uses software pipelining with cp.async but does NOT support warp specialization. All threads execute the same code path. Pipeline stages use a single set of barriers — no producer/consumer split. Without warp specialization, there are no cross-WG signal edges, so no HB-based overlap is possible. The output buffer occupies separate SMEM for the entire kernel lifetime.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "all_threads",
+      "phases": [
+        {
+          "label": "T0_prologue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "T1_mainloop",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "T2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_A", "smem_B", "smem_C"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "smem_A": {"size_bytes": 32768, "description": "A tile [128x64 f16, 2 stages]"},
+    "smem_B": {"size_bytes": 49152, "description": "B tile [64x192 f16, 2 stages]"},
+    "smem_C": {"size_bytes": 49152, "description": "Output tile [128x192 f16]"}
+  }
+}

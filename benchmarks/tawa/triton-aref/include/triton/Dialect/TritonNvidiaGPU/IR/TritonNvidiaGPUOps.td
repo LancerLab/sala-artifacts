@@ -1,0 +1,867 @@
+// Copyright (c) 2023 NVIDIA Corporation & Affiliates. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files
+// (the "Software"), to deal in the Software without restriction,
+// including without limitation the rights to use, copy, modify, merge,
+// publish, distribute, sublicense, and/or sell copies of the Software,
+// and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+// TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+// SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+#ifndef TRITONNVIDIAGPU_OPS
+#define TRITONNVIDIAGPU_OPS
+
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUDialect.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.td"
+include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUTypes.td"
+include "mlir/Dialect/Arith/IR/ArithBase.td"
+include "triton/Dialect/Triton/IR/TritonTypes.td"
+include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
+include "triton/Dialect/Triton/IR/TritonInterfaces.td"
+include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
+include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
+include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
+include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
+include "mlir/Interfaces/DestinationStyleOpInterface.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
+
+def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
+def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
+def TensorMemory : Resource<"::mlir::triton::nvidia_gpu::TensorMemory">;
+
+class TTNG_Op<string mnemonic, list<Trait> traits = []> :
+    Op<TritonNvidiaGPU_Dialect, mnemonic,
+       !listconcat(traits, [VerifyTensorLayoutsTrait])> {
+}
+
+def TTNG_FenceAsyncSharedOp : TTNG_Op<"fence_async_shared"> {
+  let arguments = (ins BoolAttr:$bCluster);
+
+  let summary = "fence proxy async";
+
+  let assemblyFormat = "attr-dict";
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return computeCapability >= 90;
+    }
+  }];
+}
+
+def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
+  let arguments = (ins I1Attr:$relaxed);
+  let assemblyFormat = "attr-dict";
+}
+
+def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
+  let assemblyFormat = "attr-dict";
+}
+
+//
+// WarpGroupDot Op
+//
+def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                                                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                                     DeclareOpInterfaceMethods<DotOpInterface>,
+                                                     TypesMatchWith<"result's type matches accumulator's type",
+                                                                     "d", "c", "$_self">]> {
+    let summary = "warp group dot";
+
+    let description = [{
+        $d = matrix_multiply($a, $b) + $c. For docs on InputPrecisionAttr, see TT_DotOp
+    }];
+
+    let arguments = (ins TTG_TensorOrMemDesc:$a,
+                         TTG_TensorOrMemDesc:$b,
+                         TT_FpIntTensor:$c,
+                         Optional<I1>:$useC,
+                         DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
+                         DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc,
+                         DefaultValuedAttr<BoolAttr, "false">:$isAsync);
+
+    let results = (outs TT_FpIntTensor:$d);
+
+    let assemblyFormat = "$a`,` $b`,` $c (`,` $useC^)? attr-dict `:` type($a) `*` type($b) `->` type($d)";
+
+    let extraClassDeclaration = [{
+      bool needsPartialAccumulator();
+    }];
+}
+
+def TTNG_WarpGroupDotWaitOp : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                                                              AllTypesMatch<["inputs", "outputs"]>]> {
+  let summary = "warp group dot wait";
+  let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs, I32Attr:$pendings);
+  let results = (outs Variadic<TTG_TensorOrMemDesc>:$outputs);
+  let description = [{
+    Waits until there are $pendings or fewer outstanding async dot operations.
+
+    $inputs must be the tensors corresponding to the async dot ops that we're
+    waiting on.  For example, if there are N pending async dot ops and we call
+    `warp_group_dot_wait 1`, then $inputs must be the result of the first dot op.
+  }];
+
+  let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
+}
+
+def TTNG_InitBarrierOp : TTNG_Op<"init_barrier"> {
+  let summary = "Initialize a barrier in the given shared memory allocation.";
+
+  let description = [{
+      Initializes a shared memory allocation with mbarrier information.
+      `alloc` is a descriptor to the shared memory allocation. `count` is the
+      number of arrives expected by the barrier.
+
+      This lowers to PTX mbarrier.init.shared::cta.b64.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$count
+  );
+  let assemblyFormat = "$alloc `,` $count attr-dict `:` qualified(type($alloc))";
+  let hasVerifier = 1;
+}
+
+def TTNG_InvalBarrierOp : TTNG_Op<"inval_barrier"> {
+  let summary = "Invalidate a barrier allocation.";
+
+  let description = [{
+    Invalidate a barrier allocation so that it can be re-used. According to PTX
+    spec this has to be done before any reuse of the memory used by mbarrier.
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-inval
+  }];
+
+  let hasVerifier = 1;
+  let arguments = (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc);
+  let assemblyFormat = "$alloc attr-dict `:` qualified(type($alloc))";
+}
+
+def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect"> {
+  let summary = "Signal a barrier of an expected number of bytes to be copied.";
+
+  let description = [{
+    This signal the barrier that `size` bytes are expected to be copied. The
+    associated barrier wait will block until the expected number of bytes are copied.
+  }];
+
+  let hasVerifier = 1;
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$size,
+    I1:$pred
+  );
+
+  let assemblyFormat = [{
+    $alloc `,` $size attr-dict `,` $pred `:` qualified(type($alloc))
+  }];
+}
+
+def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
+  let summary = "wait until the mbarrier phase completes.";
+
+  let description = [{
+    Blocks the program progress until the mbarrier object in `alloc` completes
+    its current phase.
+
+    This lowers a waitloop using PTX instruction
+    mbarrier.try_wait.parity.shared.b64.
+
+    Accepts optional list of memory. If present, it is assumed that any of the
+    dependencies may be accessed until the barrier completes.
+
+    The barrier behavior is described here:
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-asynchronous-copy-completion-mechanisms
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+    I32:$phase,
+    Optional<I1>:$pred,
+    Variadic<TTG_MemDescType>:$deps
+  );
+
+  let builders = [
+    OpBuilder<(ins "Value":$alloc, "Value":$phase),
+    [{
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{});
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred),
+    [{
+    build($_builder, $_state, alloc, phase, pred, /*deps=*/{});
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "Value":$phase, "ValueRange":$deps),
+    [{
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps);
+    }]>,
+  ];
+
+  let assemblyFormat = [{
+    $alloc `,` $phase (`,` $pred^)? (`deps` $deps^)?
+    attr-dict `:` qualified(type($alloc)) (`,` type($deps)^)?
+  }];
+  let hasVerifier = 1;
+}
+
+def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
+  let summary = "perform the arrive operation on an mbarrier";
+  let description = [{
+    The `ttng.arrive_barrier` operation performs the "arrive" operation on an
+    mbarrier object in shared memory. The operation requires a `count` attribute
+    of at least 1, and decreasing the pending arrival count of the mbarrier by
+    the specific count.
+
+    The operation accepts an optional predicate.
+
+    Example:
+
+    ```mlir
+    ttng.arrive_barrier %barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %barrier, 1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ```
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
+    I32Attr:$count,
+    Optional<I1>:$pred
+  );
+
+  let assemblyFormat = [{
+    $alloc `,` $count (`,` $pred^)? attr-dict `:` qualified(type($alloc))
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
+      return build($_builder, $_state, alloc, count, /*pred=*/Value());
+    }]>
+  ];
+
+  let hasVerifier = 1;
+}
+
+def TTNG_TensorDescToTMAPtrOp : TTNG_Op<"tensor_desc_to_tma_ptr", [Pure]> {
+  let summary = "Convert tensor descriptor to pointer to tma descriptor";
+
+  let arguments = (ins TT_TensorDescType:$desc);
+  let results = (outs TT_Ptr:$ptr);
+
+  let assemblyFormat = [{
+    $desc attr-dict `:` qualified(type($desc)) `to` qualified(type($ptr))
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Value":$desc), [{
+      auto ptrTy = triton::PointerType::get($_builder.getI8Type(), 1);
+      build($_builder, $_state, ptrTy, desc);
+    }]>
+  ];
+
+  let hasCanonicalizeMethod = 1;
+}
+
+
+def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local"> {
+  let summary = "copy data based on descriptor from global memory to local memory asynchronously";
+
+  let description = [{
+    This operation copies data from global memory to local memory
+    asynchronously.  This is analogue to tt.load except the data are copied to
+    local memory pointed by the memory descriptor instead of a distributed
+    tensor. The data copied depends on the global memory descriptor pointed to
+    by `desc_ptr`.
+  }];
+
+  let hasVerifier = 1;
+  let arguments = (ins
+    Arg<TT_PtrType, "", [MemRead<GlobalMemory>]>:$desc_ptr,
+    Variadic<I32>:$coord,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
+    I1:$pred,
+    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
+    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
+    DefaultValuedAttr<BoolAttr, "false">:$isVolatile
+  );
+
+  let assemblyFormat = [{
+    $desc_ptr `[` $coord `]` $result `,` $barrier `,` $pred
+    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
+    attr-dict `:` qualified(type($desc_ptr)) `,` qualified(type($barrier)) `->` qualified(type($result))
+  }];
+}
+
+def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
+  let summary = "copy data based on descriptor from local memory to global memory asynchronously";
+
+  let description = [{
+    This operation copies data from local memory to global memory
+    asynchronously.  This is analogue to tt.store except the data are copied from
+    local memory pointed by the memory descriptor instead of a distributed
+    tensor. The data copied depends on the global memory descriptor pointed to
+    by `desc_ptr`.
+  }];
+
+  let arguments = (ins
+    Arg<TT_PtrType, "", [MemWrite<GlobalMemory>]>:$desc_ptr,
+    Variadic<I32>:$coord,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = [{
+    $desc_ptr `[` $coord `]` $src
+    attr-dict `:` qualified(type($desc_ptr)) `,` qualified(type($src))
+  }];
+}
+
+def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
+  let summary = "reduce result in gmem based on a TMA descriptor";
+
+  let description = [{
+    This operation copies data from local memory to global memory
+    asynchronously, and atomically performs the specified reduction kind.
+    Atomicity is at the granularity of individual elements, and only relaxed
+    semantics are implied.
+  }];
+
+  let arguments = (ins
+    TT_DescriptorReduceKindAttr:$kind,
+    Arg<TT_PtrType, "", [MemRead<GlobalMemory>]>:$desc_ptr,
+    Variadic<I32>:$coord,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = [{
+    $kind `,` $desc_ptr `[` $coord `]` $src
+    attr-dict `:` qualified(type($desc_ptr)) `,` qualified(type($src))
+  }];
+}
+
+def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather"> {
+  let summary = "gather data based on descriptor from global memory to local memory asynchronously";
+
+  let description = [{
+    This operation gathers multiple rows of data from global memory matrix to
+    local memory asynchronously.  This is similar to
+    async_tma_copy_global_to_local except that each row is indexed independently.
+  }];
+
+  let arguments = (ins
+    Arg<TT_PtrType, "", [MemRead<GlobalMemory>]>:$desc_ptr,
+    RankedTensorOf<[I32]>:$x_offsets,
+    I32:$y_offset,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
+    I1:$pred
+  );
+
+  let assemblyFormat = [{
+    $desc_ptr `[` $x_offsets `,` $y_offset `]` $result `,` $barrier `,` $pred
+    attr-dict `:` type(operands)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def TTNG_AsyncTMAScatterOp : TTNG_Op<"async_tma_scatter"> {
+  let summary = "scatter data from local memory into global memory based on a descriptor asynchronously";
+
+  let description = [{
+    The `ttng.async_tma_scatter` operation scatters multiple separately-indexed
+    rows of data from local memory into global memory asynchronously. The
+    operation scatters a 2D tensor in shared memory, laid out by core tensor
+    tiles nvmma_shared layout into separately indexed rows in global
+    memory at a given `y` offset.
+  }];
+
+  let arguments = (ins
+    Arg<TT_PtrType, "", [MemWrite<GlobalMemory>]>:$desc_ptr,
+    RankedTensorOf<[I32]>:$x_offsets,
+    I32:$y_offset,
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = [{
+    $desc_ptr `[` $x_offsets `,` $y_offset `]` $src
+    attr-dict `:` type(operands)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait"> {
+  let summary = "wait until all the inputs are read.";
+  let arguments = (ins I32Attr:$pendings);
+  let description = [{
+    Wait until all the read operations are done from the associated store operations.
+    This is needed before the shared memory can be written to.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<DotOpInterface>,
+    DeclareOpInterfaceMethods<MMAv5OpInterface>,
+    AttrSizedOperandSegments
+]> {
+  let summary = "block level op mapping to tensorcore gen5 mma";
+
+  let description = [{
+    $d += matrix_multiply($a, $b).
+    If no barrier is given the op is assumed to be synchronous otherwise the op will trigger a commit/arrive on the given barrier.
+    If there is a barrier the result will be safe to read after a barrier wait.
+    If $two_ctas is set the op will execute a matmul across two contiguous CTAs, it will read the data distributed across the two CTAs.
+    and syncronize both CTAs if the op is synchronous.
+
+    This operation takes and produces an optional token to indicate TMEM read
+    and write on its accumulator operand. When the tokens are present, they can
+    be used to check aliasing and modref on the accumulator memory.
+  }];
+
+  let arguments = (ins
+    TTG_MemDescType:$a,
+    TTG_MemDescType:$b,
+    TTG_MemDescType:$d,
+    Optional<TTG_AsyncToken>:$acc_dep,
+    I1:$useD,
+    I1:$pred,
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I1>:$barrier_preds,
+    OptionalAttr<UnitAttr>:$is_async,
+    OptionalAttr<UnitAttr>:$two_ctas
+  );
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let builders = [
+    OpBuilder<(ins "Type":$token,
+      "Value":$a, "Value":$b, "Value":$d, "Value":$acc_dep, "Value":$useD,
+      "Value":$pred, CArg<"bool", "false">:$two_ctas,
+      CArg<"ValueRange", "{}">:$barriers,
+      CArg<"ValueRange", "{}">:$barrier_preds,
+      CArg<"bool", "false">:$is_async)>
+  ];
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $useD`,`
+    $pred `` custom<BarriersAndPreds>($barriers, $barrier_preds)
+    attr-dict `:` qualified(type($a)) `,` qualified(type($b)) `,`
+    qualified(type($d)) (`,` qualified(type($barriers))^)?
+  }];
+}
+
+def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims", "verifyOutputDims"]>,
+    DeclareOpInterfaceMethods<MMAv5OpInterface>,
+    AttrSizedOperandSegments
+]> {
+  let summary = "block level op mapping to tensorcore gen5 mma";
+
+  let description = [{
+    $d += matrix_multiply(scale($lhs, $lhs_scale), scale(rlhs, $rhs_scale))
+    If no barrier is given the op is assumed to be synchronous otherwise the op will trigger a commit/arrive on the given barrier.
+    If there is a barrier the result will be safe to read after a barrier wait.
+
+    This operation takes and produces an optional token to indicate TMEM read
+    and write on its accumulator operand. When the tokens are present, they can
+    be used to check aliasing and modref on the accumulator memory.
+  }];
+
+  let arguments = (ins
+    TTG_MemDescType:$a,
+    TTG_MemDescType:$b,
+    TTG_MemDescType:$d,
+    Optional<TTG_AsyncToken>:$acc_dep,
+    TTG_MemDescType:$a_scale,
+    TTG_MemDescType:$b_scale,
+    TT_ScaleDotElemTypeAttr:$a_type,
+    TT_ScaleDotElemTypeAttr:$b_type,
+    I1:$useD,
+    I1:$pred,
+    Variadic<TTG_MemDescType>:$barriers,
+    Variadic<I1>:$barrier_preds,
+    OptionalAttr<UnitAttr>:$is_async
+  );
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let extraClassDeclaration = [{
+    int64_t getBlockM();
+    int64_t getBlockN();
+    int64_t getBlockK();
+  }];
+
+  let builders = [
+    // Namespaces need to be prefixed so ODS prefers our
+    // custom builder signature over the default-generated one.
+    OpBuilder<(ins "::mlir::Type":$token,
+      "::mlir::Value":$a, "::mlir::Value":$b, "::mlir::Value":$d,
+      "::mlir::Value":$acc_dep, "::mlir::Value":$a_scale,
+      "::mlir::Value":$b_scale, "::mlir::triton::ScaleDotElemType":$a_type,
+      "::mlir::triton::ScaleDotElemType":$b_type,
+      "::mlir::Value":$useD, "::mlir::Value":$pred,
+      CArg<"::mlir::ValueRange", "{}">:$barriers,
+      CArg<"::mlir::ValueRange", "{}">:$barrier_preds,
+      CArg<"bool", "false">:$is_async
+      )>
+  ];
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $a_scale `,`
+    $b_scale `,` $useD `,` $pred `lhs` `=` $a_type `rhs` `=` $b_type
+    `` custom<BarriersAndPreds>($barriers, $barrier_preds)
+    attr-dict `:` qualified(type($a)) `,` qualified(type($b)) `,`
+    qualified(type($d)) `,` qualified(type($a_scale)) `,`
+    qualified(type($b_scale)) (`,` qualified(type($barriers))^)?
+  }];
+}
+
+def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load"> {
+  let summary = "Load a buffer from tensor memory into a distributed tensor";
+
+  let description = [{
+    This is similar to ttg.local_load except the result layout is restricted to only few possibility.
+    Therefore we cannot combine this op with any convert layout like local_load.
+
+    This operation takes and produces an optional token to indicate TMEM read
+    on its source operand. When the tokens are present, they can
+    be used to check aliasing and modref on the TMEM buffer.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<TensorMemory>]>:$src,
+    Optional<TTG_AsyncToken>:$dep
+  );
+  let results = (outs
+    TT_Tensor:$result,
+    Optional<TTG_AsyncToken>:$token
+  );
+
+  let assemblyFormat = [{
+    $src `` custom<Token>($dep, type($token))
+    attr-dict `:` qualified(type($src)) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    RankedTensorType getType() { return getResult().getType(); }
+    operator TypedValue<RankedTensorType>() { return getResult(); }
+  }];
+}
+
+def TTNG_TMEMStoreOp : TTNG_Op<"tmem_store"> {
+  let summary = "Store a distributed tensor into a buffer in tensor memory";
+
+  let description = [{
+    This is similar to ttg.local_store except the source layout is restricted to only few possibility.
+
+    This operation takes and produces an optional token to indicate TMEM write
+    on its source operand. When the tokens are present, they can
+    be used to check aliasing and modref on the TMEM buffer.
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemWrite<TensorMemory>]>:$dst,
+    Optional<TTG_AsyncToken>:$dep,
+    TT_Tensor:$src,
+    I1:$pred
+  );
+  let results = (outs Optional<TTG_AsyncToken>:$token);
+
+  let assemblyFormat = [{
+    $src `,` $dst `` custom<Token>($dep, type($token)) `,` $pred
+    attr-dict `:` type($src) `->` qualified(type($dst))
+  }];
+  let hasVerifier = 1;
+}
+
+def TTNG_TMEMAllocOp : TTNG_Op<"tmem_alloc", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "allocate tensor memory";
+  let description = [{
+    This operation allocates buffer in tensor memory and return a descriptor
+    containing the address and a view of the buffer.
+    This is similar to ttg.local_alloc except the buffer is allocated in tensor memory.
+
+    Explicitly deallocating a buffer is optional; see local_dealloc.
+  }];
+  let arguments = (ins Optional<TT_Tensor>:$src);
+  let results = (outs
+    TTG_MemDescType:$result,
+    Optional<TTG_AsyncToken>:$token
+  );
+
+  let assemblyFormat = [{
+    ($src^)? attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    triton::gpu::MemDescType getType() { return getResult().getType(); }
+    operator TypedValue<triton::gpu::MemDescType>() { return getResult(); }
+  }];
+}
+
+def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure]> {
+  let summary = "Take a subslice of a tensor memory allocation";
+  let description = [{
+    This operation takes a subslice of a tensor memory allocation and returns a new descriptor
+    containing the address and a view of the subslice.
+    This is similar to ttg.memdesc_subview except the offset needs to be static and we can only
+    slice alog the inner dimension of a 2D memdesc as this is the only one we can do for TMem.
+  }];
+  let arguments = (ins TTG_MemDescType:$src, I32Attr:$N);
+
+  let assemblyFormat = [{
+    $src attr-dict `:` qualified(type($src)) `->` qualified(type($result))
+  }];
+
+  let builders = [
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
+    ];
+  let results = (outs TTG_MemDescType:$result);
+  let hasVerifier = 1;
+}
+
+def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
+  let summary = "Initiate an asynchronous copy operation from shared memory to the Tensor Memory.";
+
+  let description = [{
+    2D blocks stored contiguously in SMEM are copied into TMEM as specified by the destination address.
+    The completion of the copy can be observed by waiting on the optional barrier. If this op is used
+    together with an MMA op, one barrier can be used to wait for both copy and MMA. We do not need to wait
+    for the completion of the copy before MMA, since tcgen05.cp followed by tcgen05.mma is guaranteed to
+    execute in that order.
+
+    This op lowers to the PTX instruction tcgen05.cp. Right now, we only support 1CTA and the warpx4.32x128b
+    variant of the instruction. Each 32x128b block in SMEM is duplicated over 4 warps and stored into 128 rows
+    and 4 columns of TMEM. The primary use case of this op is to copy blocked scales from SMEM to TMEM.
+
+    The shape of the input SMEM can be flexibily chosen depending on use cases. In the simplest case (e.g. unit test),
+    the source SMEM can be of shape (32 x num_blocks, 16), and the destination TMEM should be of shape (128, 16 x num_blocks),
+    for copying 8 bit values. For scaled GEMM, rep_m x rep_k copies of a 32x128b block need to be stored in SMEM, where
+    rep_m = BLOCK_M / 128, rep_k = BLOCK_K / scale_vec_size / 4, and scale_vec_size = 32 for MXFP.
+    Conceptually, the SMEM is organized in a high-dimensional layout, (rep_m, rep_k, 32, 4, 4B).
+    Some of axes can be flattened into one, to reduce the rank of the load. For example, the following patterns are supported:
+     * (rep_m, rep_k * 32 x 4 x 4B), 2D scale load with cp.async
+     * (rep_m, rep_k, 32, 16B), 4D scale load with TMA
+     * (rep_m, rep_k, 32, 4, 4B), 5D scale load with cp.async
+    Since rep_m blocks are not contiguous in SMEM, this axis cannot be flattened into inner ones.
+
+    In Triton, the TMEM memdesc for blocked scales must be of the following form:
+    * Its shape must be (BLOCK_MN, BLOCK_K / scale_vec_size), representing the logical shape of blocked scales.
+    * It must be attached with `tensor_memory_scales_encoding` to indicate the chunk-based layout and its duplication over 4 warps.
+
+    In contrast, the src SMEM must be in the explicit chunk-based layout as described above. So the IR might look like this:
+
+    %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+    ttng.tmem_copy %1, %0 : (!ttg.memdesc<1x1x32x4x4xi8, #shared1, #smem>, !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>) -> ()
+
+    We interpret the semantics of this copy operation as follows. The chunk-based layout in SMEM implies that
+    the logical shape (BLOCK_MN, BLOCK_K / scale_vec_size) in TMEM is the result of certain reshape and transpose operations.
+    In practice, to take an advantage of the native scale layout and the TMEM copy op,  users need to do
+    `scales5D.trans(0, 3, 2, 1, 4).reshape(BLOCK_M, BLOCK_K // scale_vec_size)` before feeding scales into dot_scaled.
+    When we use tmem_copy in the IR, such reshape and transpose operations are removed. But the change in the logical shape they have caused on
+    registers is now understood to be incorporated into tmem_copy itself. Ideally, we would lift reshape / transpose done on registers onto
+    the SMEM memdesc, making tmem_copy a straightforward 2D copy operation: (BLOCK_MN, BLOCK_K / scale_vec_size) -> (BLOCK_MN, BLOCK_K / scale_vec_size).
+    In the absence of such operations on memdesc, we resort to implicitly encoding the reshape/transpose semantics in tmem_copy.
+
+  }];
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Arg<TTG_MemDescType, "", [MemWrite<TensorMemory>]>:$dst,
+    Optional<TTG_MemDescType>:$barrier
+  );
+
+  let assemblyFormat = [{$src `,` $dst `,` $barrier attr-dict `:` functional-type(operands, results)}];
+  let hasVerifier = 1;
+}
+
+def TTNG_WarpGroupOp : TTNG_Op<"warp_group", [
+  RecursiveMemoryEffects, RecursivelySpeculatable,
+]> {
+  let summary = "container op for a warp group";
+  let description = [{ Contains warp-group code }];
+
+  let arguments = (ins
+    I32Attr:$startWarp,
+    I32Attr:$numWarps,
+    I32Attr:$regCount);
+
+  let regions = (region VariadicRegion<MinSizedRegion<1>>:$partitionRegions);
+  let assemblyFormat = [{
+    `start_warp` `(` $startWarp `)` `num_warps` `(` $numWarps `)` `reg_count` `(` $regCount `)` `:` `{` $partitionRegions attr-dict `}`
+  }];
+}
+
+def TTNG_WarpGroupReturnOp : TTNG_Op<"warp_group_return", [
+  Pure, Terminator, ReturnLike, HasParent<"WarpGroupOp">
+]> {
+  let summary = "implicit terminator for a warp group region";
+  let description = [{ Warp group region terminator }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TTNG_ArefCreateOp : TTNG_Op<"aref_create", [
+    RangedTypesMatchWith<"input types match Aref output type",
+                        "result", "operands", "::llvm::cast<ArefType>($_self).getBaseType()">]> {
+  let summary = "create an aref";
+  let arguments = (
+    ins Variadic<TTG_MemDescType>:$operands
+  );
+  let results = (outs TTNG_ArefType:$result);
+  let assemblyFormat = [{$operands attr-dict `:` type($result)}];
+}
+def TTNG_ArefGetEnterOp : TTNG_Op<"aref_get.enter", [
+    AttrSizedResultSegments,
+    DeclareOpInterfaceMethods<ArefEnterOpInterface>
+]> {
+  let summary = "Enter ArefGet region where the buffer can be used to read data";
+  let description = [{ You have entered a "region" where you can freely read from the buffer.
+                      These ArefGet "regions" can span multiple iterations. }];
+
+  let arguments = (ins TTNG_ArefType:$aref,
+                       I32:$index);
+  // enterOp can also return a AsyncToken if the associated tmem buffer is mutable
+  // for immutable buffers, the assocated token will have NoneType
+  let results = (outs Variadic<TTG_MemDescType>:$buffers,
+                      Variadic<AnyTypeOf<[TTG_AsyncToken,NoneType]>>:$tokens);
+
+  let assemblyFormat = [{
+    $aref `[` $index `]` attr-dict `:` type($aref) `->` type($buffers)  type($tokens)
+  }];
+}
+
+
+def TTNG_ArefGetExitOp : TTNG_Op<"aref_get.exit", [
+  DeclareOpInterfaceMethods<ArefExitOpInterface>
+  ]> {
+  let summary = "Exit ArefGet region, where the buffer should no longer be used";
+  let description = [{ You have left the region where you can freely read from the buffer).
+                      These ArefGet "regions" can span multiple iterations. }];
+
+  let arguments = (ins TTNG_ArefType:$aref,
+                       I32:$index,
+                       TTNG_ArefConsumerArrayAttr:$consumers
+                  );
+  let assemblyFormat = [{
+    $aref `[` $index `]` `,` `consumers` `=` $consumers attr-dict `:` type($aref)
+ }];
+}
+
+def TTNG_ArefPutEnterOp : TTNG_Op<"aref_put.enter", [
+  AttrSizedResultSegments,
+  DeclareOpInterfaceMethods<ArefEnterOpInterface>
+  ]> {
+  let summary = "Enter ArefPut region where the buffer can be used to read data";
+  let description = [{ You have entered a "region" where you can freely read from the buffer)
+                      These ArefPut "regions" can span multiple iterations. }];
+
+  // see comment for TTNG_ArefGetEnterOp
+  let arguments = (ins TTNG_ArefType:$aref,
+                       I32:$index);
+  // see comment on TTNG_ArefPutEnterOp
+  let results = (outs Variadic<TTG_MemDescType>:$buffers,
+                      Variadic<AnyTypeOf<[TTG_AsyncToken,NoneType]>>:$tokens);
+  let assemblyFormat = [{
+    $aref `[` $index `]` attr-dict `:` type($aref) `->` type($buffers) type($tokens)
+  }];
+}
+
+def TTNG_ArefPutExitOp : TTNG_Op<"aref_put.exit", [
+  DeclareOpInterfaceMethods<ArefExitOpInterface>
+  ]> {
+  let summary = "Exit ArefPut region, where the buffer should no longer be used";
+  let description = [{ You have left the region where you can freely read from the buffer).
+                      These ArefPut "regions" can span multiple iterations. }];
+
+  let arguments = (ins TTNG_ArefType:$aref,
+                       I32:$index,
+                       TTNG_ArefProducerArrayAttr:$producers
+                   );
+  let assemblyFormat = [{
+    $aref `[` $index `]` `,` `producers` `=` $producers attr-dict `:` type($aref)
+ }];
+}
+
+def TTNG_ArefPhiOp : TTNG_Op<"aref_phi"> {
+  let summary = "Aref phi";
+  let description = [{
+    This operation is a phi operation for Aref.
+      %val = aref_phi %local, %remote
+    It is added by the aref insertion pass to indicate which %local variable is used
+    in the producer group, and which %remote variable is used in consumer groups.
+
+    This situation occurs when a producer is also an additional consumer of its variable, e.g.
+
+      %val = ..      @gr1
+        .. = %val    @gr1, @gr2
+
+    after aref insertion
+
+      %val = ..                           @gr1
+      %dst = ttng.aref_put.enter %aref    @gr1
+      store %val, %buf                    @gr1
+      ttng.aref_put.exit %aref            @gr1
+
+      %src = ttng.aref_get.enter %aref    @gr2
+      %val' = load %src                   @gr2
+      ttng.aref_get.exit %aref            @gr2
+
+      %val'' = ttng.aref_phi %val, %val'
+
+      // replace all uses of %val with %val''
+      .. = %val''
+
+    after code splitting we get
+
+    @gr1 {
+
+      %val = ..                           @gr1
+      %dst = ttng.aref_put.enter %aref    @gr1
+      store %val, %buf                    @gr1
+      ttng.aref_put.exit %aref            @gr1
+
+      = .. %val
+    }
+
+    @gr2 {
+
+      %src = ttng.aref_get.enter %aref    @gr2
+      %val' = load %src                   @gr2
+      ttng.aref_get.exit %aref            @gr2
+
+      = .. %val'
+    }
+
+  }];
+  let arguments = (ins
+    AnyType:$local,
+    AnyType:$remote
+  );
+  let results = (outs AnyType:$result);
+  let assemblyFormat = [{
+    $local `,` $remote attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+
+
+#endif

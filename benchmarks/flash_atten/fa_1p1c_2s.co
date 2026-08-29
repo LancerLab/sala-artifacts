@@ -1,0 +1,205 @@
+// Simplified flash attention demonstrating SALA overlap opportunity.
+// Uses 2D parameters (single-head) to enable TMA store for output.
+// SALA should find: O_s can overlap with q_shared because O_s is only
+// written AFTER the mainloop (q_shared lifetime has ended).
+
+#define BLOCK_M 64
+#define BLOCK_N 128
+#define SWIZ 128
+#define STAGES 2
+#define DIM 64
+
+__co__ void flash_atten_sala(
+  global f16[Q_SEQ, DIM] Q,
+  global f16[KV_SEQ, DIM] K,
+  global f16[KV_SEQ, DIM] V,
+  global f16[Q_SEQ, DIM] O
+) {
+  float scale = 0.18033688f;
+
+  parallel {bm} by [cdiv(Q_SEQ, BLOCK_M)] : block {
+    shared f16[BLOCK_M, DIM] q_shared;
+    shared f16[BLOCK_N, DIM] k_buf[STAGES];
+    shared f16[BLOCK_N, DIM] v_buf[STAGES];
+    shared f16[BLOCK_M, DIM] O_s;
+    shared event qf, kvf[STAGES], kve[STAGES];
+
+    kv_bound = cdiv(KV_SEQ, BLOCK_N);
+
+    parallel p by [2] : group-4, t by 128 : thread {
+      inthreads.async (p == 0 && t == 0) {
+        tma.copy.async<qf>.swiz<SWIZ>
+          Q.subspan(BLOCK_M, DIM).at(bm, 0) => q_shared;
+        trigger qf;
+
+        foreach {bn} in [kv_bound] {
+          stage = bn % STAGES;
+          wait kve[stage];
+          tma.copy.async<kvf[stage]>.swiz<SWIZ>
+            K.subspan(BLOCK_N, DIM).at(bn, 0) => k_buf[stage];
+          tma.copy.async<kvf[stage]>.swiz<SWIZ>
+            V.subspan(BLOCK_N, DIM).at(bn, 0) => v_buf[stage];
+          trigger kvf[stage];
+        }
+      }
+
+      inthreads.async (p > 0) {
+        foreach {s} in [STAGES] {
+          trigger kve[s];
+        }
+
+        wait qf;
+
+        fragment f32[BLOCK_M] scores_max {-inf};
+        fragment f32[BLOCK_M] scores_max_prev;
+        fragment f32[BLOCK_M] scores_scale;
+        fragment f32[BLOCK_M] scores_sum;
+        fragment f32[BLOCK_M] logsum {0.0f};
+        acc_o = mma.fill.f32 0.0f;
+
+        foreach {bn} in [kv_bound] {
+          stage = bn % STAGES;
+          acc_s = mma.fill.f32 0.0f;
+
+          wait kvf[stage];
+          mma.row.row acc_s, q_shared, k_buf[stage];
+
+          frag.copy scores_max_prev, scores_max;
+          frag.reduce_max acc_s, scores_max, 1;
+          frag.apply scores_max, [](i) { return __max(scores_max.at(i), scores_max_prev.at(i)); };
+          frag.apply scores_scale, [](i) { return __exp2f(scores_max_prev.at(i) * scale - scores_max.at(i) * scale);};
+          frag.apply acc_s, [](i, j) { return __exp2f(acc_s.at(i, j) * scale - scores_max.at(i) * scale);};
+          frag.reduce_sum acc_s, scores_sum, 1;
+          frag.apply logsum, [](i) { return logsum.at(i) * scores_scale.at(i) + scores_sum.at(i);};
+          frag.apply acc_o, [](i, j) { return acc_o.at(i, j) * scores_scale.at(i);};
+
+          fragment f16[BLOCK_M, BLOCK_N] acc_s_cast;
+          frag.apply acc_s_cast, [](i, j) { return __to<f16>(acc_s.at(i, j));};
+
+          mma.row.col acc_o, acc_s_cast, v_buf[stage];
+          trigger kve[stage];
+        }
+
+        frag.apply acc_o, [](i, j) { return acc_o.at(i, j) / logsum.at(i); };
+        mma.store acc_o, O_s;
+        tma.copy O_s => O.subspan(BLOCK_M, DIM).at(bm, 0);
+      }
+    }
+  }
+}
+
+#include <cmath>
+#include <iostream>
+#include <random>
+#include <vector>
+
+static bool verify_and_bench(int QS, int KVS, const char* label) {
+  const int D = DIM;
+  const float scale = (1.0f / std::sqrt((float)D)) * 1.44269504f;
+
+  auto Q_h = choreo::make_spandata<choreo::f16>((size_t)QS, (size_t)D);
+  auto K_h = choreo::make_spandata<choreo::f16>((size_t)KVS, (size_t)D);
+  auto V_h = choreo::make_spandata<choreo::f16>((size_t)KVS, (size_t)D);
+  auto O_h = choreo::make_spandata<choreo::f16>((size_t)QS, (size_t)D);
+
+  std::mt19937 gen(42);
+  std::uniform_real_distribution<float> dq(-0.5f, 0.5f), dv(-1.0f, 1.0f);
+  for (size_t i = 0; i < (size_t)QS * D; ++i)
+    Q_h.data()[i] = choreo::f16(dq(gen));
+  for (size_t i = 0; i < (size_t)KVS * D; ++i)
+    K_h.data()[i] = choreo::f16(dq(gen));
+  for (size_t i = 0; i < (size_t)KVS * D; ++i)
+    V_h.data()[i] = choreo::f16(dv(gen));
+  O_h.fill(0.0f);
+
+  choreo::f16 *q_d, *k_d, *v_d, *o_d;
+  size_t qb = QS * D * sizeof(choreo::f16);
+  size_t kb = KVS * D * sizeof(choreo::f16);
+  cudaMalloc(&q_d, qb);
+  cudaMalloc(&k_d, kb);
+  cudaMalloc(&v_d, kb);
+  cudaMalloc(&o_d, qb);
+  cudaMemcpy(q_d, Q_h.data(), qb, cudaMemcpyHostToDevice);
+  cudaMemcpy(k_d, K_h.data(), kb, cudaMemcpyHostToDevice);
+  cudaMemcpy(v_d, V_h.data(), kb, cudaMemcpyHostToDevice);
+  cudaMemset(o_d, 0, qb);
+  cudaDeviceSynchronize();
+
+  auto Qv = choreo::make_spanview<choreo::f16, 2>(q_d, {(size_t)QS, (size_t)D});
+  auto Kv = choreo::make_spanview<choreo::f16, 2>(k_d, {(size_t)KVS, (size_t)D});
+  auto Vv = choreo::make_spanview<choreo::f16, 2>(v_d, {(size_t)KVS, (size_t)D});
+  auto Ov = choreo::make_spanview<choreo::f16, 2>(o_d, {(size_t)QS, (size_t)D});
+
+  choreo::TimerOption topt;
+  topt.warmup = 10;
+  topt.repeat = 50;
+  auto launch = [&]() {
+    flash_atten_sala(Qv, Kv, Vv, Ov);
+    choreo::abend_true(cudaDeviceSynchronize());
+  };
+  double avg_ms = choreo::timing(launch, topt);
+  double flops = 2.0 * 2.0 * QS * KVS * D;
+  double tflops = flops / (avg_ms / 1000.0) / 1e12;
+
+  cudaMemcpy(O_h.data(), o_d, qb, cudaMemcpyDeviceToHost);
+  cudaDeviceSynchronize();
+
+  size_t total = QS * D, nsamp = 512;
+  size_t stride = choreo::pick_coprime_stride(total, D, nsamp);
+  float max_err = 0; double sum_err = 0; size_t checked = 0, failed = 0;
+  for (size_t idx = 0; idx < total && checked < nsamp; idx += stride) {
+    int qi = (int)(idx / D), di = (int)(idx % D);
+    std::vector<float> sc(KVS);
+    float rmax = -1e30f;
+    for (int kj = 0; kj < KVS; ++kj) {
+      float dot = 0;
+      for (int d = 0; d < D; ++d)
+        dot += choreo::to_f32(Q_h.data()[qi * D + d]) *
+               choreo::to_f32(K_h.data()[kj * D + d]);
+      sc[kj] = dot;
+      rmax = std::max(rmax, dot);
+    }
+    float lsum = 0;
+    for (int kj = 0; kj < KVS; ++kj) {
+      sc[kj] = exp2f(sc[kj] * scale - rmax * scale);
+      lsum += sc[kj];
+    }
+    float acc = 0;
+    for (int kj = 0; kj < KVS; ++kj)
+      acc += sc[kj] * choreo::to_f32(V_h.data()[kj * D + di]);
+    float ref = acc / lsum;
+    float got = choreo::to_f32(O_h.data()[qi * D + di]);
+    float err = std::abs(got - ref);
+    max_err = std::max(max_err, err);
+    sum_err += err;
+    if (err > 0.05f + 0.1f * std::abs(ref)) ++failed;
+    ++checked;
+  }
+
+  float avg = checked ? (float)(sum_err / checked) : 0;
+  float fr = checked ? (float)failed / checked : 0;
+  bool ok = fr < 0.01f;
+  std::cout << "[" << label << "] avg_ms=" << avg_ms
+            << " TFLOPS=" << tflops
+            << " max_abs_err=" << max_err << " avg_abs_err=" << avg
+            << " fail_rate=" << fr << " (" << failed << "/" << checked
+            << ") " << (ok ? "PASS" : "FAIL") << "\n";
+
+  cudaFree(q_d); cudaFree(k_d); cudaFree(v_d); cudaFree(o_d);
+  return ok;
+}
+
+int main() {
+  struct { int qs, kvs; const char* label; } cfgs[] = {
+    {512, 512, "QS=512 KVS=512"},
+    {1024, 1024, "QS=1024 KVS=1024"},
+    {2048, 2048, "QS=2048 KVS=2048"},
+    {4096, 4096, "QS=4096 KVS=4096"},
+    {8192, 8192, "QS=8192 KVS=8192"},
+  };
+  bool all_ok = true;
+  for (auto& c : cfgs)
+    all_ok = verify_and_bench(c.qs, c.kvs, c.label) && all_ok;
+  std::cout << (all_ok ? "Test Passed" : "Test FAILED") << "\n";
+  return all_ok ? 0 : 1;
+}

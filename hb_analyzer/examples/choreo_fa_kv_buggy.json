@@ -1,0 +1,48 @@
+{
+  "kernel": "fa_kv_overlap_buggy",
+  "framework": "choreo",
+  "arch": "sm_90a",
+  "notes": "BUGGY version: producer does NOT wait for k_empty/v_empty before loading. K and V are written in the SAME phase. HB analysis correctly reports: UNSAFE, cannot overlap K_s and V_s.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P_all_load",
+          "signal_in": null,
+          "signal_out": "v_full",
+          "buffers": ["K_s", "V_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "k_empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_use_K",
+          "signal_in": "k_full",
+          "signal_out": "k_empty",
+          "buffers": ["K_s"]
+        },
+        {
+          "label": "C2_use_V",
+          "signal_in": "v_full",
+          "signal_out": "v_empty",
+          "buffers": ["V_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "K_s": {"size_bytes": 16384, "description": "K tile"},
+    "V_s": {"size_bytes": 16384, "description": "V tile"}
+  }
+}

@@ -1,0 +1,19 @@
+# Generated evaluation outputs (scripts write *.result next to the repo tree).
+*.result
+
+# Build directories (any level: the root cmake build, the vendored
+# triton-aref's own build, etc. — the fork additionally carries its
+# own .gitignore for its build internals).
+build/
+
+# Python: __pycache__ etc.; keep __init__.py/__main__.py trackable.
+__*
+!__init__.py
+!__main__.py
+
+# CUTLASS submodule checkout (gitlink tracked; inner files covered by
+# the submodule's own .gitignore).
+extern/cutlass
+
+# One-time setup output (setup_cutlass.sh clones the v4.5.0 headers here).
+benchmarks/cutlass/extern/

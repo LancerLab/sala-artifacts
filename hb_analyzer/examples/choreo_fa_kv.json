@@ -1,0 +1,73 @@
+{
+  "kernel": "fa_kv_overlap",
+  "framework": "choreo",
+  "arch": "sm_90a",
+  "notes": "Flash Attention forward with separate K/V pipeline events. Producer loads K then V with independent full/empty event pairs. Consumer processes K then V sequentially. HB analysis proves K_s and V_s are temporally disjoint.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_wait_k_empty",
+          "signal_in": "k_empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P1_load_K",
+          "signal_in": null,
+          "signal_out": "k_full",
+          "buffers": ["K_s"]
+        },
+        {
+          "label": "P2_wait_v_empty",
+          "signal_in": "v_empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P3_load_V",
+          "signal_in": null,
+          "signal_out": "v_full",
+          "buffers": ["V_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer",
+      "phases": [
+        {
+          "label": "C0_init",
+          "signal_in": null,
+          "signal_out": "k_empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_use_K",
+          "signal_in": "k_full",
+          "signal_out": "k_empty",
+          "buffers": ["K_s"]
+        },
+        {
+          "label": "C2_use_V",
+          "signal_in": "v_full",
+          "signal_out": "v_empty",
+          "buffers": ["V_s"]
+        },
+        {
+          "label": "C3_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["O_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "K_s": {"size_bytes": 16384, "description": "K tile [BN x HD, f16, 2 stages]"},
+    "V_s": {"size_bytes": 16384, "description": "V tile [BN x HD, f16, 2 stages]"},
+    "O_s": {"size_bytes": 8192, "description": "Output accumulator [BR x HD, f16]"}
+  }
+}

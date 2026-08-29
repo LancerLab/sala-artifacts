@@ -1,0 +1,87 @@
+{
+  "kernel": "fa_fwd_full_pipeline",
+  "framework": "choreo",
+  "arch": "sm_90a",
+  "notes": "Full Flash Attention forward with all buffers: Q (loaded once), K/V (loaded per iteration via separate pipelines), softmax scratch S, and output accumulator O. This is the realistic FA pattern. Q is live throughout the mainloop. K and V are pipelined with disjoint lifetimes. S (softmax scratch for online softmax) is live only during QK^T computation. O is written in epilogue.",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "producer",
+      "phases": [
+        {
+          "label": "P0_load_Q",
+          "signal_in": null,
+          "signal_out": "q_ready",
+          "buffers": ["Q_s"]
+        },
+        {
+          "label": "P1_wait_k_empty",
+          "signal_in": "k_empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P2_load_K",
+          "signal_in": null,
+          "signal_out": "k_full",
+          "buffers": ["K_s"]
+        },
+        {
+          "label": "P3_wait_v_empty",
+          "signal_in": "v_empty",
+          "signal_out": null,
+          "buffers": []
+        },
+        {
+          "label": "P4_load_V",
+          "signal_in": null,
+          "signal_out": "v_full",
+          "buffers": ["V_s"]
+        }
+      ]
+    },
+    {
+      "wg_id": 1,
+      "role": "consumer",
+      "phases": [
+        {
+          "label": "C0_init_events",
+          "signal_in": null,
+          "signal_out": "k_empty",
+          "buffers": []
+        },
+        {
+          "label": "C1_wait_Q",
+          "signal_in": "q_ready",
+          "signal_out": null,
+          "buffers": ["Q_s"]
+        },
+        {
+          "label": "C2_QKT_mma",
+          "signal_in": "k_full",
+          "signal_out": "k_empty",
+          "buffers": ["Q_s", "K_s", "S_s"]
+        },
+        {
+          "label": "C3_softmax_PV",
+          "signal_in": "v_full",
+          "signal_out": "v_empty",
+          "buffers": ["Q_s", "V_s", "S_s"]
+        },
+        {
+          "label": "C4_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["O_s"]
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "Q_s": {"size_bytes": 16384, "description": "Q tile [BR x HD, f16, 1 copy]"},
+    "K_s": {"size_bytes": 16384, "description": "K tile [BN x HD, f16, 2 stages]"},
+    "V_s": {"size_bytes": 16384, "description": "V tile [BN x HD, f16, 2 stages]"},
+    "S_s": {"size_bytes": 8192, "description": "Softmax scratch [BR x BN, f16]"},
+    "O_s": {"size_bytes": 16384, "description": "Output tile [BR x HD, f16]"}
+  }
+}

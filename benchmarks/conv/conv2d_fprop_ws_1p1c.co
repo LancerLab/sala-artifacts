@@ -1,0 +1,177 @@
+#include <cstring>
+#include <cstdlib>
+
+// Warp-specialized 1P1C implicit-GEMM convolution forward pass
+// (the paper's conv2d_fprop_ws_1p1c: Figure 2 item 9, 96->64 KB, 33%).
+// The im2col mapping lives in the TMA descriptors (the activation is
+// consumed as an im2col view act_col [NPQ x C]); the sync pattern is
+// identical to a GEMM.
+
+#define BLOCK_NPQ 128   // pixel rows per output tile
+#define C_CHUNK 64      // channels per K-step
+#define BLOCK_K 128     // output channels per tile
+#define SWIZ 128
+#define STAGES 2
+
+#define MATMUL_DEFAULT_M 1024   // NPQ (pixels)
+#define MATMUL_DEFAULT_N 2048   // K (output channels)
+#define MATMUL_DEFAULT_K 256    // C (input channels)
+
+__co__ void conv2d_fprop(
+  global f16 [NPQ_TOT, C_TOT] act_col,
+  global f16 [K_TOT, C_TOT] flt,
+  global f16 [NPQ_TOT, K_TOT] out
+) {
+  parallel {block_m, block_n} by [cdiv(NPQ_TOT, BLOCK_NPQ), cdiv(K_TOT, BLOCK_K)] : block {
+    shared event full[STAGES], empty[STAGES];
+    shared f16 [BLOCK_NPQ / 2, C_CHUNK] act_s0[STAGES];
+    shared f16 [BLOCK_NPQ / 2, C_CHUNK] act_s1[STAGES];
+    shared f16 [BLOCK_K, C_CHUNK] flt_s[STAGES];
+    shared f16 [BLOCK_NPQ, BLOCK_K] out_s;
+
+    parallel p1 by 2 : group-4, t by 128 : thread {
+      inthreads.async (p1 == 0 && t == 0) {
+        foreach {iv_c} in [cdiv(C_TOT, C_CHUNK)] {
+          stage = iv_c % STAGES;
+          wait empty[stage];
+          tma.copy.async<full[stage]>.swiz<SWIZ>
+            act_col.subspan(BLOCK_NPQ / 2, C_CHUNK).at(block_m * 2, iv_c) => act_s0[stage];
+          tma.copy.async<full[stage]>.swiz<SWIZ>
+            act_col.subspan(BLOCK_NPQ / 2, C_CHUNK).at(block_m * 2 + 1, iv_c) => act_s1[stage];
+          tma.copy.async<full[stage]>.swiz<SWIZ>
+            flt.subspan(BLOCK_K, C_CHUNK).at(block_n, iv_c) => flt_s[stage];
+          trigger full[stage];
+        }
+      }
+
+      inthreads.async (p1 == 1) {
+        acc_0 = mma.fill.f32 0.0f;
+        acc_1 = mma.fill.f32 0.0f;
+        foreach {s} in [STAGES] {
+          trigger empty[s];
+        }
+        foreach {iv_c} in [cdiv(C_TOT, C_CHUNK)] {
+          stage = iv_c % STAGES;
+          wait full[stage];
+          mma.row.row acc_0, act_s0[stage], flt_s[stage];
+          mma.row.row acc_1, act_s1[stage], flt_s[stage];
+          trigger empty[stage];
+        }
+        mma.store acc_0, out_s.subspan(BLOCK_NPQ / 2, BLOCK_K).at(0, 0);
+        mma.store acc_1, out_s.subspan(BLOCK_NPQ / 2, BLOCK_K).at(1, 0);
+        tma.copy out_s => out.subspan(BLOCK_NPQ, BLOCK_K).at(block_m, block_n);
+      }
+    }
+  }
+}
+
+int main(int argc, char** argv) {
+  bool enable_timing = true;
+  bool skip_verify = false;
+  double user_flops = -1.0;
+  auto is_disable_timing_arg = [](const char* s) {
+    const char* t = "--disable-timing";
+    int i = 0;
+    while (t[i] != '\0' && s[i] == t[i]) ++i;
+    return t[i] == '\0' && s[i] == '\0';
+  };
+  auto is_skip_verify_arg = [](const char* s) {
+    const char* t = "--skip-verify";
+    int i = 0;
+    while (t[i] != '\0' && s[i] == t[i]) ++i;
+    return t[i] == '\0' && s[i] == '\0';
+  };
+  for (int i = 1; i < argc; ++i) {
+    if (is_disable_timing_arg(argv[i])) {
+      enable_timing = false;
+      continue;
+    }
+    if (is_skip_verify_arg(argv[i])) {
+      skip_verify = true;
+    }
+    if (std::strncmp(argv[i], "--flops=", 8) == 0) {
+      user_flops = std::atof(argv[i] + 8);
+      continue;
+    }
+  }
+
+  const char* timing_env = std::getenv("CHOREO_DISABLE_TIMING");
+  if (timing_env && timing_env[0] == '1' && timing_env[1] == '\0') {
+    enable_timing = false;
+  }
+
+  const char* skip_verify_env = std::getenv("CHOREO_SKIP_VERIFY");
+  if (skip_verify_env && skip_verify_env[0] == '1' && skip_verify_env[1] == '\0') {
+    skip_verify = true;
+  }
+
+  size_t M = MATMUL_DEFAULT_M;
+  size_t N = MATMUL_DEFAULT_N;
+  size_t K = MATMUL_DEFAULT_K;
+
+  auto act_h = choreo::make_spandata<choreo::f16>(M, K);
+  auto flt_h = choreo::make_spandata<choreo::f16>(N, K);
+  auto res_h = choreo::make_spandata<choreo::f16>(M, N);
+  act_h.fill_random(0, 2);
+  flt_h.fill_random(0, 2);
+  res_h.fill(0.0f);
+
+  half *a_d = nullptr, *b_d = nullptr, *c_d = nullptr;
+  choreo::abend_true(cudaMalloc(&a_d, M * K * sizeof(half)));
+  choreo::abend_true(cudaMalloc(&b_d, N * K * sizeof(half)));
+  choreo::abend_true(cudaMalloc(&c_d, M * N * sizeof(half)));
+
+  choreo::abend_true(cudaMemcpy(a_d, act_h.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
+  choreo::abend_true(cudaMemcpy(b_d, flt_h.data(), N * K * sizeof(half), cudaMemcpyHostToDevice));
+  choreo::abend_true(cudaMemcpy(c_d, res_h.data(), M * N * sizeof(half), cudaMemcpyHostToDevice));
+  choreo::abend_true(cudaDeviceSynchronize());
+
+  auto act_d = choreo::make_spanview<choreo::f16, 2>(a_d, {M, K});
+  auto flt_d = choreo::make_spanview<choreo::f16, 2>(b_d, {N, K});
+  auto out_d = choreo::make_spanview<choreo::f16, 2>(c_d, {M, N});
+  if (enable_timing) {
+    int warmup = 10;
+    int repeat = 500;
+    const char* warmup_env = std::getenv("CHOREO_TIMING_WARMUP");
+    const char* repeat_env = std::getenv("CHOREO_TIMING_REPEAT");
+    if (warmup_env) {
+      int value = std::atoi(warmup_env);
+      if (value >= 0) warmup = value;
+    }
+    if (repeat_env) {
+      int value = std::atoi(repeat_env);
+      if (value > 0) repeat = value;
+    }
+    choreo::TimerOption topt;
+    topt.warmup = warmup;
+    topt.repeat = repeat;
+    auto avg_ms = choreo::timing([&]() { conv2d_fprop(act_d, flt_d, out_d); cudaDeviceSynchronize(); }, topt);
+    std::cout << "Timing avg ms: " << avg_ms << "\n";
+
+    double flops = (user_flops > 0.0) ? user_flops : (2.0 * double(M) * double(N) * double(K));
+    double tflops = (flops / (avg_ms / 1000.0)) / 1e12;
+    std::cout << "TFLOPS: " << tflops << "\n";
+  } else {
+    conv2d_fprop(act_d, flt_d, out_d);
+  }
+
+  choreo::abend_true(cudaMemcpy(res_h.data(), c_d, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+  choreo::abend_true(cudaDeviceSynchronize());
+
+  if (skip_verify) {
+    std::cout << "Test Passed (verify skipped)\n" << std::endl;
+    return 0;
+  }
+
+  auto act_view = act_h.view();
+  auto flt_view = flt_h.view();
+  auto res_view = res_h.view();
+
+  choreo::SampledVerifierConfig vcfg;
+  vcfg.num_samples = 512;
+  vcfg.base_tol = 0.5f;
+  vcfg.rel_tol = 0.02f;
+  choreo::verify_matmul_row_row_sampled(act_view, flt_view, res_view, vcfg);
+
+  std::cout << "Test Passed\n" << std::endl;
+}

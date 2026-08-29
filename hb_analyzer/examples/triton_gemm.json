@@ -1,0 +1,36 @@
+{
+  "kernel": "triton_matmul_sm90",
+  "framework": "triton",
+  "arch": "sm_90a",
+  "notes": "Triton GEMM kernel. Triton compiles tile-level operations to LLVM IR and emits PTX. It uses software pipelining (multi-buffering) within a single thread group. No warp specialization, no cross-WG signals. All buffers are live concurrently during the mainloop. Output is written to registers then stored to global memory directly (no smem epilogue in typical Triton GEMM).",
+  "warp_groups": [
+    {
+      "wg_id": 0,
+      "role": "all_threads",
+      "phases": [
+        {
+          "label": "T0_prologue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "T1_mainloop",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": ["smem_A", "smem_B"]
+        },
+        {
+          "label": "T2_epilogue",
+          "signal_in": null,
+          "signal_out": null,
+          "buffers": []
+        }
+      ]
+    }
+  ],
+  "shared_buffers": {
+    "smem_A": {"size_bytes": 32768, "description": "A tile [128x64 f16, multi-buffered]"},
+    "smem_B": {"size_bytes": 49152, "description": "B tile [64x192 f16, multi-buffered]"}
+  }
+}
