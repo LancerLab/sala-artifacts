@@ -17,6 +17,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--stages", type=int, default=3)
 parser.add_argument("--seq", type=int, default=4096)
 parser.add_argument("--gpu", type=int, default=1)
+parser.add_argument("--check", action="store_true",
+                    help="compare the output against a fp32 torch reference "
+                         "(run WITHOUT ncu: the reference uses torch kernels)")
+parser.add_argument("--membar", type=int, default=1, choices=(0, 1),
+                    help="force the cross-tile mbarrier synchronization the SALA "
+                         "overlap requires (default 1: without it the 3-stage "
+                         "kernel races and produces NaNs; SMEM is identical)")
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -48,7 +55,7 @@ for _ in range(3):
         BLOCK_M=128, BLOCK_N=128, NUM_STAGES=args.stages,
         NUM_WARPS=8, USE_TTG_WS=False,
         WG_SPEC="mma_first", MATH_WG_PIPE=True,
-        FORCE_MEMBAR=False,
+        FORCE_MEMBAR=bool(args.membar),
     )
 torch.cuda.synchronize()
 
@@ -58,8 +65,35 @@ o = run_attention(
     BLOCK_M=128, BLOCK_N=128, NUM_STAGES=args.stages,
     NUM_WARPS=8, USE_TTG_WS=False,
     WG_SPEC="mma_first", MATH_WG_PIPE=True,
-    FORCE_MEMBAR=False,
+    FORCE_MEMBAR=bool(args.membar),
 )
 torch.cuda.synchronize()
 
 print(f"Done: {args.stages}-stage, SEQ={N_CTX}, output shape={o.shape}")
+
+if args.check:
+    # Numerical reference: fp32 softmax(q k^T * scale, causal) @ v, computed
+    # one (batch, head) at a time to bound memory.
+    ref = torch.empty((BATCH, H, N_CTX, HEAD_DIM), dtype=torch.float32, device=o.device)
+    rows = torch.arange(N_CTX, device=o.device)
+    mask = rows[None, :] > rows[:, None]          # causal: key > query masked
+    with torch.no_grad():
+        for b in range(BATCH):
+            for h in range(H):
+                qb = q[b, h].float()
+                kb = k[b, h].float()
+                vb = v[b, h].float()
+                s = (qb @ kb.t()) * sm_scale
+                s = s.masked_fill(mask, float("-inf"))
+                ref[b, h] = torch.softmax(s, dim=-1) @ vb
+    got = o.float()
+    diff = (got - ref).abs()
+    max_abs = diff.max().item()
+    ref_scale = ref.abs().max().item()
+    tol = 0.02 + 0.02 * ref_scale
+    bad = int((diff > tol).sum().item())
+    ok = (bad == 0) and torch.isfinite(got).all().item()
+    print(f"FMHA reference (fp32 torch, causal): max|o-ref|={max_abs:.4f} "
+          f"(ref scale {ref_scale:.3f}, tol {tol:.4f}), {bad} element(s) over tol "
+          f"-> {'PASS' if ok else 'FAIL'}")
+    sys.exit(0 if ok else 1)

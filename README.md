@@ -6,7 +6,10 @@ XComp statistic in Figure 2, Table 2 (cross-framework), Table 3
 (occupancy), Figure 3 (throughput), and Table 4 (ablation). A fresh
 clone on an H100/H800 reproduces all compiler-reported and
 `ncu`-measured shared-memory values exactly, plus register counts and
-occupancy, and every kernel passes its CPU-reference correctness check.
+occupancy. Every XComp kernel passes its CPU-reference correctness
+check in both modes; the CUTLASS and Tawa rows are ncu-measured SMEM
+comparisons, with the numerical verification described in §2.3/§2.4
+and the limits in §6.3.
 
 | Requirement | Value |
 |---|---|
@@ -119,16 +122,20 @@ correctness check (Test Passed in both modes) — the paper's
 
 ### 1.4 Verification (correctness)
 
-Every kernel-compiled item passes its harness's independent
-CPU-reference check in both modes (`--no-sala` and SALA):
+Every **executed** XComp kernel (items 1–4, 7–9) passes its harness's
+independent CPU-reference check in both modes (`--no-sala` and SALA).
+Items 5 and 6 are HB-analyzer *models* (`hb_analyzer/`, a standalone
+stdlib-only Python tool) — they are static-analysis results, not
+executed kernels, and have no runtime output to check:
 
-| Items | Check | Result |
-|-------|-------|--------|
-| GEMM (f16 1P1C/1P2C/1P3C, e4m3) | harness CPU reference, 2048³ (fp32 full-K dot, 5% tolerance) | **Test Passed** ×2 modes each |
-| FA tuned 1P2C | naive-attention reference (0 failed samples required), B=2 H=16 SEQ=512..16384 | **Test Passed**, fail_rate=0, ×2 modes |
-| FA 3s | same harness, SALA side | **Test Passed** (baseline cannot launch) |
-| FA 1P1C 2s | built-in naive-attention reference, 5 configs (SEQ 512–8192) | **Test Passed** 5/5, ×2 modes |
-| Conv2d (item 9) | row-row sampled GEMM check (fp32 reference, 5% tolerance) | **Test Passed** ×2 modes |
+| Items | Kind | Check | Result |
+|-------|------|-------|--------|
+| GEMM (f16 1P1C/1P2C/1P3C, e4m3) | kernel | harness CPU reference, 2048³ (fp32 full-K dot, 5% tolerance) | **Test Passed** ×2 modes each |
+| FA tuned 1P2C | kernel | naive-attention reference (0 failed samples required), B=2 H=16 SEQ=512..16384 | **Test Passed**, fail_rate=0, ×2 modes |
+| FA 3s | kernel | same harness, SALA side | **Test Passed** (baseline cannot launch) |
+| FA 1P1C 2s | kernel | built-in naive-attention reference, 5 configs (SEQ 512–8192) | **Test Passed** 5/5, ×2 modes |
+| Conv2d (item 9) | kernel | row-row sampled GEMM check (fp32 reference, 5% tolerance) | **Test Passed** ×2 modes |
+| HB-analyzer items 5, 6 | model | n/a — static analysis over vendored pattern JSONs | n/a |
 
 `Test Passed` (or the scripts' `[Test Passed]` per row) is the success
 marker; `Test FAILED`, a nonzero `fail_rate`, or `[NO-RUN]` (no
@@ -192,6 +199,34 @@ GPU=0 bash reproduce/table_cross_framework_cutlass.sh
 | Coop 128² 4s | 165.89 | 132.10 | 166→132 (20%) |
 | Coop 128×256 2s | 133.12 | 99.33 | 133→99 (25%) |
 
+**Numerical verification and its limit.** The script verifies both
+binaries against a sampled fp32 reference (4096 output elements,
+fp32 dot products over the same fp16 inputs; tolerance
+`0.1 + 1% · |ref|`), and exits nonzero on any mismatch:
+
+- the **baseline** (pristine v4.5.0 struct) is verified at the
+  measurement size (2048³) — max |D−D_ref| ≈ 0.007;
+- the **union** build is verified at 1024² per side, where every CTA
+  owns a single work tile — max |D−D_ref| ≈ 0.008. At the 2048³
+  measurement size the union run reports
+  `Reference: NOT CHECKED here` for the reason below.
+
+*Why the union is only verified in that regime:* the union shares the
+epilogue's staging buffers with the mainloop's pipeline stages. With
+the persistent scheduler a CTA processes several work tiles (>114
+tiles on an 114-SM H800), and the **next** tile's mainloop TMA loads
+then overwrite the shared memory while the previous tile's epilogue is
+still staging its stores. A `NamedBarrier::sync` between `mma_tail()`
+and `epilogue.store()` — the manual pattern CUTLASS requires —
+synchronizes the consumer warps only and **does not** prevent this: we
+reproduced wrong results (thousands of mismatching elements per
+4096-sample check) with that barrier in place. Making the overlap
+correct under persistent scheduling requires gating the *producer*
+warps, which the manual workaround does not do. This is exactly the
+hazard class SALA's analysis rules out by construction — and the
+reason CUTLASS keeps 19/21 of its warp-specialized kernels on
+`struct`.
+
 ### 2.4 Tawa rows (own toolchain, Python 3.10, ~30 min incl. setup)
 
 ```bash
@@ -214,6 +249,21 @@ use torch only for tensor allocation.)
 | 64×128 2s | 65.57 | 49.18 | 66→49 (25%) |
 | FA WS 2s | 198.74 | 163.93 | 199→164 (18%) |
 | FA WS 3s | 258.1* | 229.53 | 258*→230 (11%) |
+
+**FMHA synchronization (and a checked reference).** The FMHA kernel is
+run with `--membar 1` (`tawa_fmha_ncu.py`) — the cross-tile mbarrier
+synchronization the SALA overlap requires, and part of the paper's Tawa
+prototype ("full SALA prototype, cross-tile `bar.sync`"). **Without it
+the 3-stage kernel races**: we measured 192–832 NaN elements per run in
+that configuration (varying between runs), while with it the output is
+exact. The SMEM numbers are identical either way (163.93 / 229.53 KB),
+so the rows reproduce the paper exactly.
+
+The script also checks the FMHA outputs against a **fp32 torch causal
+reference** (2 % + 2 % tolerance, `--check`) for both stages and both
+modes and exits nonzero on mismatch — max |o − ref| ≈ 0.001. The
+3-stage baseline cannot launch (it exceeds the 227 KB limit — the
+paper's `*`), so only the SALA side of that row is checked.
 
 ---
 
@@ -305,7 +355,7 @@ matching the paper's ~360
 at its pinned config (B=2 H=16). The flatness — the paper's claim that
 the 197→164 KB reduction does not affect FA throughput — holds at
 B=1 H=16 (~305 TFLOPS) and B=2 H=16 alike. See §6.2 for the
-config-dependence and §6.4 for why the FA row uses short repeats.
+config-dependence and §6.6 for why the FA row uses short repeats.
 
 ---
 
@@ -385,7 +435,64 @@ H=16 SEQ=16384) and the paper's Table 3 carries the measured values
 (§3). The only Table-3 cells not re-measured are the CUTLASS and
 Tawa rows (register-bound; SMEM/occupancy are unchanged).
 
-### 6.4 Why the FA row uses short repeats (H800 power budget)
+Correctness coverage differs per family, and the scripts say so
+explicitly rather than printing a blanket verdict:
+
+- **XComp rows (Figures 2–3, Table 3 GEMM/FA, Table 4 conv)**: full
+  CPU-reference checks, both modes (§1.4).
+- **CUTLASS rows**: the baseline is verified numerically at 2048³;
+  the struct→union build is verified at 1024² (single work tile per
+  CTA). At 2048³ the union run prints `NOT CHECKED` — the shared
+  epilogue/mainloop storage needs cross-tile producer gating under
+  persistent scheduling, which the manual workaround does not
+  implement (§2.3). The SMEM numbers are unaffected by this: they are
+  a property of the kernel, not of the work assignment.
+- **Tawa rows**: SMEM measurements via `ncu`. The **FMHA** outputs are
+  additionally checked against a fp32 torch reference in both stages
+  and both modes (2 % + 2 % tolerance; the 3-stage baseline cannot
+  launch, so only its SALA side is checked) — see §2.4, including the
+  `--membar` requirement without which the 3-stage kernel races. The
+  **GEMM** rows run the fork's own kernel with the SALA allocator gate
+  but are not numerically compared here, so no correctness claim is
+  made for them.
+
+### 6.4 H100 vs H800: which numbers move
+
+The paper's measurements are from an **H800** (PCIe). Two Table-3 /
+Figure-3 quantities are machine-sensitive, and the artifact documents
+them so a reviewer on an H100 can interpret their own numbers:
+
+- **Act. (`sm__warps_active`) for 1P1C-3s**: 14.2→20.4 % on the H800;
+  on an H100 reviewers have measured ≈17.2–17.6 % for the SALA side.
+  The direction and the occupancy step (2→3 CTAs/SM) are what the
+  claim rests on; the absolute warp-active percentage depends on the
+  SM's warp-slot budget and clock behaviour.
+- **Figure-3 ratio for 1P1C-3s**: ~1.00× on the H800; on an H100 the
+  same kernel can gain ~9–10 % (1.095–1.103×) because the 3-stage
+  config sits at the 2→3 CTA/SM boundary and the H100's higher
+  per-SM issue capacity makes the extra CTA count for more. The
+  paper's claim for that row is "flat (≈1.00×)" on the measured
+  machine; the 1P1C-4s rows (1.34–1.40×) are the headline gains and
+  reproduce on both.
+
+### 6.5 Measurement methodology (trials, order, variability)
+
+- **GEMM timed runs (Figure 3)**: 10 warmup iterations + 500 timed
+  iterations per kernel, `cudaEvent` timing, baseline and SALA built
+  from the same source with only `--no-sala` differing; each config's
+  two binaries are run back-to-back in the same process order, and the
+  script prints both absolute TFLOPS and the ratio so the ratio can be
+  read within a run (absolute values drift with clock/power state).
+- **FA e2e (Table 3 / §6.6)**: warmup=2, repeat=3 (see §6.6 for why
+  the paper's 10/500 is not used there).
+- **ncu rows**: one launch per config, `launch__shared_mem_per_block_dynamic`
+  — a static property of the compiled kernel, so it does not vary
+  between runs; re-running changes nothing.
+- **Run-to-run variability** is therefore confined to the timed rows
+  (§4): expect the 1P1C-4s ratios to wander by ~±0.03× and the flat
+  rows by ~±0.02×; the SMEM/register/occupancy numbers are exact.
+
+### 6.6 Why the FA row uses short repeats (H800 power budget)
 
 The paper's 10-warmup/500-iteration methodology is used for the GEMM
 timed runs (§4); the FA e2e row deliberately uses short repeats

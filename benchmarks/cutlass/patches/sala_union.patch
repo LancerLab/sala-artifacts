@@ -1,12 +1,22 @@
---- a/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp
-+++ b/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp
-@@ -176,8 +176,11 @@
+--- a/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp	2026-09-14 09:07:58.139614727 +0800
++++ b/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp	2026-09-14 09:07:58.141614651 +0800
+@@ -29,6 +29,7 @@
+  *
+  **************************************************************************************************/
+ #pragma once
++#define SALA_UNION 1
+ 
+ #include "cutlass/cutlass.h"
+ #include "cutlass/workspace.h"
+@@ -176,8 +177,13 @@
        using MainloopTensorStorage = typename CollectiveMainloop::TensorStorage;
        using EpilogueTensorStorage = typename CollectiveEpilogue::TensorStorage;
  
 -      EpilogueTensorStorage epilogue;
 -      MainloopTensorStorage mainloop;
-+      // SALA: overlap phase-disjoint mainloop/epilogue buffers (struct -> union)
++      // SALA: overlap phase-disjoint mainloop/epilogue buffers (struct -> union).
++      // NOTE: this is the manual workaround CUTLASS requires; see the artifact
++      // README for the synchronization it needs (and its limits).
 +      union {
 +        EpilogueTensorStorage epilogue;
 +        MainloopTensorStorage mainloop;

@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <string>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -71,8 +73,16 @@ using BuildGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     BuildEpilogue<TileShape_>
 >;
 
+// The union build is identified by the SALA_UNION macro that the patch adds
+// to the patched CUTLASS header (see patches/sala_union.patch).
+#ifdef SALA_UNION
+constexpr bool kUnionBuild = true;
+#else
+constexpr bool kUnionBuild = false;
+#endif
+
 template <typename GK>
-bool run_gemm(int M, int N, int K) {
+bool run_gemm(int M, int N, int K, bool verify = true, const char* why = nullptr) {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GK>;
     using StrideA = typename GK::StrideA;
     using StrideB = typename GK::StrideB;
@@ -132,17 +142,52 @@ bool run_gemm(int M, int N, int K) {
         float v = float(h_D[i]); sum += v;
         if (v != 0.0f) nonzero++;
     }
-    printf("  GEMM: sum=%.2f nonzero=%d/%zu %s\n", sum, nonzero, elems_CD,
-           (ok && nonzero > 0) ? "PASS" : "FAIL");
+
+    // Numerical reference: sampled fp32 dot products from the same fp16 inputs.
+    // Layouts used by cutlass::make_cute_packed_stride in this test (validated
+    // against the pristine v4.5.0 struct kernel):
+    //   D (M,N) column-major -> element (m,n) at m + n*M
+    //   A (M,K) row-major    -> element (m,k) at m*K + k
+    //   B (N,K)              -> element (n,k) at n*K + k
+    if (!verify) {
+        printf("  GEMM: sum=%.2f nonzero=%d/%zu\n", sum, nonzero, elems_CD);
+        printf("  Reference: NOT CHECKED here (%s)\n", why ? why : "not requested");
+        delete[] h_A; delete[] h_B; delete[] h_D;
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C); cudaFree(d_D);
+        if (d_ws) cudaFree(d_ws);
+        return ok;
+    }
+
+    const size_t NSAMP = 4096;
+    float max_abs = 0.0f;
+    int   n_bad = 0;
+    for (size_t s = 0; s < NSAMP; s++) {
+        size_t idx = (s * 7919 + 13) % elems_CD;
+        size_t m = idx % (size_t)M, n = idx / (size_t)M;
+        float ref = 0.0f;
+        for (int k = 0; k < K; k++)
+            ref += float(h_A[(size_t)m * K + k]) * float(h_B[(size_t)n * K + k]);
+        float got = float(h_D[idx]);
+        float ae = fabsf(got - ref);
+        if (ae > max_abs) max_abs = ae;
+        if (ae > 0.1f + 0.01f * fabsf(ref)) n_bad++;
+    }
+    bool numeric_ok = (n_bad == 0);
+    printf("  GEMM: sum=%.2f nonzero=%d/%zu\n", sum, nonzero, elems_CD);
+    printf("  Reference: %zu samples, max|D-Dref|=%.4f, %d bad %s\n",
+           NSAMP, max_abs, n_bad, numeric_ok ? "PASS" : "FAIL");
+    printf("  Result: %s\n", (ok && numeric_ok) ? "PASS" : "FAIL");
+    bool pass = ok && numeric_ok;
 
     delete[] h_A; delete[] h_B; delete[] h_D;
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C); cudaFree(d_D);
     if (d_ws) cudaFree(d_ws);
-    return ok && nonzero > 0;
+    return pass;
 }
 
 template <typename TileShape_, int Stages>
-void analyze_and_run(const char* label, int M, int N, int K) {
+bool analyze_and_run(const char* label, int M, int N, int K,
+                     bool verify = true, const char* why = nullptr) {
     using GK = BuildGemmKernel<TileShape_, Stages>;
     using SS = typename GK::SharedStorage;
     using ML = typename GK::CollectiveMainloop;
@@ -178,26 +223,89 @@ void analyze_and_run(const char* label, int M, int N, int K) {
     if (new_ctas > orig_ctas) printf(" ***IMPROVED***");
     printf("\n");
 
-    run_gemm<GK>(M, N, K);
+    return run_gemm<GK>(M, N, K, verify, why);
 }
 
-int main() {
+using T128 = Shape<_128, _128, _64>;
+using T256 = Shape<_128, _256, _64>;
+
+// Work tiles for an MxN problem with the given tile shape (K is summed inside
+// the tiles, so it does not change the work-tile count).
+template <typename TileShape_>
+int work_tiles(int M, int N) {
+    int tm = size<0>(TileShape_{});
+    int tn = size<1>(TileShape_{});
+    return ((M + tm - 1) / tm) * ((N + tn - 1) / tn);
+}
+
+// The manual struct->union overlap shares the epilogue staging with the
+// mainloop stages.  With the persistent scheduler, a CTA may process several
+// work tiles; the next tile's mainloop TMA loads then overwrite the union'd
+// memory while the previous tile's epilogue is still using it.  That hazard
+// can only be prevented by gating the *producer* warps (a consumer-side
+// NamedBarrier cannot: see the README).  We therefore verify numerics only
+// where each CTA owns a single work tile.
+template <typename TileShape_, int Stages>
+bool safe_regime(int M, int N, int sm_count) {
+    if (!kUnionBuild) return true;          // struct build: correct at any size
+    return work_tiles<TileShape_>(M, N) <= sm_count;
+}
+
+int main(int argc, char** argv) {
+    bool check_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--check") check_only = true;
+    }
+
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+    if (sm_count <= 0) sm_count = 132;
+
+    if (check_only) {
+        printf("================================================\n");
+        printf("CUTLASS %s build - numerical verification\n",
+               kUnionBuild ? "struct->union" : "pristine struct");
+        printf("device: %d SMs; safe regime = work tiles <= SM count\n", sm_count);
+        printf("================================================\n");
+        int failures = 0;
+        int fm = kUnionBuild ? 1024 : 2048;   // union: 64/32 tiles <= SMs
+        int fn = kUnionBuild ? 1024 : 2048;
+        const char* note = kUnionBuild
+            ? "verified at 1024x1024 (single work tile per CTA); the 2048^3 "
+              "persistent assignment needs cross-tile producer gating"
+            : nullptr;
+        failures += !analyze_and_run<T128, 2>("128x128x64, 2-stage", fm, fn, 2048, true, note);
+        failures += !analyze_and_run<T128, 3>("128x128x64, 3-stage", fm, fn, 2048, true, note);
+        failures += !analyze_and_run<T128, 4>("128x128x64, 4-stage", fm, fn, 2048, true, note);
+        failures += !analyze_and_run<T256, 2>("128x256x64, 2-stage", fm, fn, 2048, true, note);
+        failures += !analyze_and_run<T256, 3>("128x256x64, 3-stage", fm, fn, 2048, true, note);
+        printf("\nDone: %d/5 configurations verified.\n", 5 - failures);
+        return failures ? 1 : 0;
+    }
+
     printf("================================================\n");
     printf("SALA CUTLASS Cooperative SharedStorage Analysis\n");
     printf("H100 (SM90a), 228 KB SMEM/SM\n");
     printf("================================================\n");
 
-    using T128 = Shape<_128, _128, _64>;
-    using T256 = Shape<_128, _256, _64>;
+    const char* skip_reason =
+        "persistent multi-tile assignment: the shared epilogue/mainloop storage "
+        "needs cross-tile producer gating; see README section 2.3";
 
-    analyze_and_run<T128, 2>("128x128x64, 2-stage", 2048, 2048, 2048);
-    analyze_and_run<T128, 3>("128x128x64, 3-stage", 2048, 2048, 2048);
-    analyze_and_run<T128, 4>("128x128x64, 4-stage", 2048, 2048, 2048);
-    analyze_and_run<T256, 2>("128x256x64, 2-stage", 2048, 2048, 2048);
-    analyze_and_run<T256, 3>("128x256x64, 3-stage", 2048, 2048, 2048);
+    int failures = 0;
+    failures += !analyze_and_run<T128, 2>("128x128x64, 2-stage", 2048, 2048, 2048,
+        safe_regime<T128, 2>(2048, 2048, sm_count), skip_reason);
+    failures += !analyze_and_run<T128, 3>("128x128x64, 3-stage", 2048, 2048, 2048,
+        safe_regime<T128, 3>(2048, 2048, sm_count), skip_reason);
+    failures += !analyze_and_run<T128, 4>("128x128x64, 4-stage", 2048, 2048, 2048,
+        safe_regime<T128, 4>(2048, 2048, sm_count), skip_reason);
+    failures += !analyze_and_run<T256, 2>("128x256x64, 2-stage", 2048, 2048, 2048,
+        safe_regime<T256, 2>(2048, 2048, sm_count), skip_reason);
+    failures += !analyze_and_run<T256, 3>("128x256x64, 3-stage", 2048, 2048, 2048,
+        safe_regime<T256, 3>(2048, 2048, sm_count), skip_reason);
 
-    printf("\nDone.\n");
-    return 0;
+    printf("\nDone: %d/5 configurations passed.\n", 5 - failures);
+    return failures ? 1 : 0;
 }
 
 #else

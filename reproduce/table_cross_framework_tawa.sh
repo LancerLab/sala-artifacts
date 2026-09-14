@@ -139,3 +139,32 @@ echo ""
 echo "* = compiler-reported (kernel cannot launch: 264 KB > 227 KB HW limit);"
 echo "   matches the paper's * on \"Tawa FA WS 3s 258* -> 230\"."
 echo "Paper values are these ncu measurements rounded to whole KB."
+
+# ---- Numerical verification of the FMHA rows (outside ncu) ----
+# The SMEM rows above only measure allocation; the FMHA kernel is the one row
+# whose output can be checked against a reference without leaving the fork's
+# stack, so we do: fp32 torch causal-attention reference, 2% + 2% tolerance.
+# (The GEMM rows run the fork's own kernels with the SALA allocator gate; they
+# are SMEM measurements too and are not numerics-checked here.)
+echo ""
+echo "FMHA numerical verification (fp32 torch reference, causal, SEQ=4096):"
+fmha_rc=0
+for st in 2 3; do
+    for mode in 0 1; do
+        if [[ $st -eq 3 && $mode -eq 0 ]]; then
+            echo "  SALA_ENABLE=0 stages=3: skipped (baseline exceeds the 227 KB HW"
+            echo "    limit and cannot launch - the paper's star, SMEM is compiler-reported)"
+            continue
+        fi
+        # fresh JIT cache per mode: SALA_ENABLE is not part of Triton's cache key
+        rm -rf /tmp/ae_tawa_check_cache && mkdir -p /tmp/ae_tawa_check_cache
+        out=$(SALA_ENABLE=$mode TRITON_CACHE_DIR=/tmp/ae_tawa_check_cache \
+              CUDA_VISIBLE_DEVICES=$GPU "$PY" "$FMHA" --stages "$st" --gpu "$GPU" --check 2>&1) || fmha_rc=1
+        echo "  SALA_ENABLE=$mode stages=$st: $(echo "$out" | grep -E 'FMHA reference' | tail -1)"
+    done
+done
+if [[ $fmha_rc -ne 0 ]]; then
+    echo "ERROR: FMHA numerical verification failed"
+    exit 1
+fi
+echo "FMHA outputs match the reference."

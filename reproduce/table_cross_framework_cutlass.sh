@@ -87,4 +87,24 @@ done
 echo ""
 echo "Kernel order matches cutlass_union_test.cu main(): 5 analyze_and_run calls."
 echo "Paper values are these ncu measurements rounded to whole KB."
-echo "Correctness: each binary prints GEMM PASS/FAIL per config (see full run above)."
+
+# ---- 4. Numerical verification (sampled fp32 reference) ----
+# The baseline is verified at the measurement size (2048^3).  The union build
+# shares the epilogue staging with the mainloop stages, which is only safe when
+# a CTA owns a single work tile -- the persistent 2048^3 assignment needs
+# cross-tile producer gating that this manual workaround does not implement
+# (see the README section 2.3).  So the union is verified at 1024^2, where
+# every CTA gets one work tile, and the 2048^3 union run reports NOT CHECKED.
+echo ""
+echo "Numerical verification (sampled fp32 reference, 4096 samples):"
+echo "--- baseline (struct) ---"
+"$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done"
+b_rc=${PIPESTATUS[0]}
+echo "--- SALA (struct->union) ---"
+"$WORK/cutlass_union_test_sala" --check 2>&1 | grep -E "Reference|Result|Done"
+s_rc=${PIPESTATUS[0]}
+if [[ $b_rc -ne 0 || $s_rc -ne 0 ]]; then
+    echo "ERROR: numerical verification failed (baseline rc=$b_rc, union rc=$s_rc)"
+    exit 1
+fi
+echo "Both builds numerically verified."
