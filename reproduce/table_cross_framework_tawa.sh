@@ -147,6 +147,25 @@ echo "Paper values are these ncu measurements rounded to whole KB."
 # (The GEMM rows run the fork's own kernels with the SALA allocator gate; they
 # are SMEM measurements too and are not numerics-checked here.)
 echo ""
+echo "GEMM numerical verification (fp32 torch matmul reference, 4096^3):"
+gemm_rc=0
+for cfg in "128 128 64 3" "128 128 64 2" "64 128 64 2"; do
+    set -- $cfg
+    for mode in 0 1; do
+        # fresh JIT cache per mode: SALA_ENABLE is not part of Triton's cache key
+        rm -rf /tmp/ae_tawa_check_cache && mkdir -p /tmp/ae_tawa_check_cache
+        out=$(SALA_ENABLE=$mode TRITON_CACHE_DIR=/tmp/ae_tawa_check_cache \
+              CUDA_VISIBLE_DEVICES=$GPU "$PY" "$GEMM" --bm "$1" --bn "$2" --bk "$3" --stages "$4" 2>&1) \
+              || gemm_rc=1
+        echo "  ${1}x${2} ${4}s SALA_ENABLE=$mode: $(echo "$out" | grep -E 'Correctness' | tail -1)"
+    done
+done
+if [[ $gemm_rc -ne 0 ]]; then
+    echo "ERROR: GEMM numerical verification failed"
+    exit 1
+fi
+
+echo ""
 echo "FMHA numerical verification (fp32 torch reference, causal, SEQ=4096):"
 fmha_rc=0
 for st in 2 3; do

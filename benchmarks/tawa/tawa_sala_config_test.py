@@ -9,6 +9,7 @@ Must be run with PYTHONPATH=/home/wsj/dev/triton-aref/python
 """
 
 import argparse
+import sys
 import torch
 import triton
 import triton.language as tl
@@ -92,7 +93,9 @@ def run_test(bm, bn, bk, stages):
 
     ref = torch.mm(a, b.T)
     err = (c - ref).abs().max().item() / ref.abs().max().item()
-    print(f"Correctness: rel_err={err:.6f} ({'PASS' if err < 0.05 else 'FAIL'})")
+    ok = err < 0.05
+    print(f"Correctness: rel_err={err:.6f} ({'PASS' if ok else 'FAIL'})")
+    return ok
 
 
 if __name__ == "__main__":
@@ -103,4 +106,5 @@ if __name__ == "__main__":
     parser.add_argument("--stages", type=int, default=3)
     args = parser.parse_args()
 
-    run_test(args.bm, args.bn, args.bk, args.stages)
+    ok = run_test(args.bm, args.bn, args.bk, args.stages)
+    sys.exit(0 if ok else 1)

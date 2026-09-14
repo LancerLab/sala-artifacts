@@ -7,9 +7,11 @@ XComp statistic in Figure 2, Table 2 (cross-framework), Table 3
 clone on an H100/H800 reproduces all compiler-reported and
 `ncu`-measured shared-memory values exactly, plus register counts and
 occupancy. Every XComp kernel passes its CPU-reference correctness
-check in both modes; the CUTLASS and Tawa rows are ncu-measured SMEM
-comparisons, with the numerical verification described in §2.3/§2.4
-and the limits in §6.3.
+check in both modes; the Tawa rows are checked against fp32 torch
+references (GEMM matmul; FMHA causal attention) and the CUTLASS rows
+against a sampled fp32 reference — see §2.3/§2.4 for the verification
+and §6.3 for the one documented limit (the CUTLASS union under
+persistent multi-tile scheduling).
 
 | Requirement | Value |
 |---|---|
@@ -211,7 +213,12 @@ fp32 dot products over the same fp16 inputs; tolerance
   measurement size the union run reports
   `Reference: NOT CHECKED here` for the reason below.
 
-*Why the union is only verified in that regime:* the union shares the
+*Why the union is only verified in that regime:* CUTLASS itself states
+the rule -- in `sm90_gemm_tma_warpspecialized.hpp` the union carries the
+comment *"Mainloop and epilogue don't use smem concurrently since kernel
+is non-persistent, so we can use a union"*; the persistent cooperative
+kernel (the one these rows instantiate) keeps `struct`. Mechanically, the
+union shares the
 epilogue's staging buffers with the mainloop's pipeline stages. With
 the persistent scheduler a CTA processes several work tiles (>114
 tiles on an 114-SM H800), and the **next** tile's mainloop TMA loads
@@ -258,6 +265,13 @@ the 3-stage kernel races**: we measured 192–832 NaN elements per run in
 that configuration (varying between runs), while with it the output is
 exact. The SMEM numbers are identical either way (163.93 / 229.53 KB),
 so the rows reproduce the paper exactly.
+
+The synchronization is not free: on the H800 at SEQ=4096 the FMHA
+kernel takes ~1.65 ms with `--membar 1` vs ~1.45 ms without it
+(+7–14 %; the "without" build is the racy one, so this is the price of
+correctness, not a regression against a valid baseline). No paper claim
+depends on Tawa timing — its rows are SMEM/occupancy measurements, both
+unchanged by the barrier.
 
 The script also checks the FMHA outputs against a **fp32 torch causal
 reference** (2 % + 2 % tolerance, `--check`) for both stages and both
@@ -452,9 +466,9 @@ explicitly rather than printing a blanket verdict:
   and both modes (2 % + 2 % tolerance; the 3-stage baseline cannot
   launch, so only its SALA side is checked) — see §2.4, including the
   `--membar` requirement without which the 3-stage kernel races. The
-  **GEMM** rows run the fork's own kernel with the SALA allocator gate
-  but are not numerically compared here, so no correctness claim is
-  made for them.
+  **GEMM** rows are checked too: fp32 torch matmul reference, rel. err
+  < 5 % (`tawa_sala_config_test.py` prints it and exits nonzero on
+  failure).
 
 ### 6.4 H100 vs H800: which numbers move
 
