@@ -229,6 +229,67 @@ bool analyze_and_run(const char* label, int M, int N, int K,
 using T128 = Shape<_128, _128, _64>;
 using T256 = Shape<_128, _256, _64>;
 
+// ---------------------------------------------------------------------------
+// Non-persistent kernel: CUTLASS itself unions the mainloop and epilogue
+// storage here -- sm90_gemm_tma_warpspecialized.hpp carries the comment
+// "Mainloop and epilogue don't use smem concurrently since kernel is
+// non-persistent, so we can use a union".  One work tile per CTA means the
+// two phases cannot overlap, which is exactly the condition SALA's analysis
+// checks before it permits an overlap.  This kernel needs no patch: the
+// overlap is already in CUTLASS, and we verify its numerics here.
+// ---------------------------------------------------------------------------
+using KernelScheduleNP   = cutlass::gemm::KernelTmaWarpSpecialized;
+using EpilogueScheduleNP = cutlass::epilogue::TmaWarpSpecialized;
+
+template <typename TileShape_>
+using BuildEpilogueNP = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    TileShape_, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementCompute,
+    ElementC, LayoutC, AlignmentC,
+    ElementD, LayoutD, AlignmentD,
+    EpilogueScheduleNP
+>::CollectiveOp;
+
+template <typename TileShape_, int Stages>
+using BuildMainloopNP = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    ElementA, LayoutA, AlignmentA,
+    ElementB, LayoutB, AlignmentB,
+    ElementAccumulator,
+    TileShape_, ClusterShape,
+    cutlass::gemm::collective::StageCount<Stages>,
+    KernelScheduleNP
+>::CollectiveOp;
+
+template <typename TileShape_, int Stages>
+using BuildGemmKernelNP = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    BuildMainloopNP<TileShape_, Stages>,
+    BuildEpilogueNP<TileShape_>
+>;
+
+template <typename TileShape_, int Stages>
+bool nonpersistent_check(const char* label, int M, int N, int K) {
+    using GK = BuildGemmKernelNP<TileShape_, Stages>;
+    using SS = typename GK::SharedStorage;
+    using ML = typename GK::CollectiveMainloop;
+    using EP = typename GK::CollectiveEpilogue;
+
+    size_t ml = sizeof(typename ML::TensorStorage);
+    size_t ep = sizeof(typename EP::TensorStorage);
+    size_t ss = sizeof(SS);
+
+    printf("\n--- %s, non-persistent (CUTLASS union) ---\n", label);
+    printf("  Mainloop TensorStorage = %.1f KB, Epilogue = %.1f KB\n",
+           ml / 1024.0, ep / 1024.0);
+    printf("  SharedStorage = %.1f KB vs %.1f KB if the two were laid out "
+           "separately %s\n", ss / 1024.0, (ml + ep) / 1024.0,
+           (ss < ml + ep) ? "(overlapped - CUTLASS's own union)" : "(not overlapped)");
+    return run_gemm<GK>(M, N, K, true);
+}
+
 // Work tiles for an MxN problem with the given tile shape (K is summed inside
 // the tiles, so it does not change the work-tile count).
 template <typename TileShape_>
@@ -280,7 +341,19 @@ int main(int argc, char** argv) {
         failures += !analyze_and_run<T256, 2>("128x256x64, 2-stage", fm, fn, 2048, true, note);
         failures += !analyze_and_run<T256, 3>("128x256x64, 3-stage", fm, fn, 2048, true, note);
         printf("\nDone: %d/5 configurations verified.\n", 5 - failures);
-        return failures ? 1 : 0;
+
+        // The non-persistent kernel: CUTLASS's own union, one work tile per
+        // CTA -- the valid case SALA's analysis permits, verified here.
+        printf("\n\n================================================\n");
+        printf("Non-persistent kernel (CUTLASS's own union; no patch)\n");
+        printf("================================================\n");
+        int np_fail = 0;
+        np_fail += !nonpersistent_check<T128, 2>("128x128x64, 2-stage", 2048, 2048, 2048);
+        np_fail += !nonpersistent_check<T128, 3>("128x128x64, 3-stage", 2048, 2048, 2048);
+        np_fail += !nonpersistent_check<T256, 2>("128x256x64, 2-stage", 2048, 2048, 2048);
+        printf("\nNon-persistent: %d/3 configurations verified.\n", 3 - np_fail);
+
+        return (failures || np_fail) ? 1 : 0;
     }
 
     printf("================================================\n");

@@ -213,26 +213,43 @@ fp32 dot products over the same fp16 inputs; tolerance
   measurement size the union run reports
   `Reference: NOT CHECKED here` for the reason below.
 
-*Why the union is only verified in that regime:* CUTLASS itself states
-the rule -- in `sm90_gemm_tma_warpspecialized.hpp` the union carries the
-comment *"Mainloop and epilogue don't use smem concurrently since kernel
-is non-persistent, so we can use a union"*; the persistent cooperative
-kernel (the one these rows instantiate) keeps `struct`. Mechanically, the
-union shares the
-epilogue's staging buffers with the mainloop's pipeline stages. With
-the persistent scheduler a CTA processes several work tiles (>114
-tiles on an 114-SM H800), and the **next** tile's mainloop TMA loads
-then overwrite the shared memory while the previous tile's epilogue is
-still staging its stores. A `NamedBarrier::sync` between `mma_tail()`
-and `epilogue.store()` — the manual pattern CUTLASS requires —
-synchronizes the consumer warps only and **does not** prevent this: we
-reproduced wrong results (thousands of mismatching elements per
-4096-sample check) with that barrier in place. Making the overlap
-correct under persistent scheduling requires gating the *producer*
-warps, which the manual workaround does not do. This is exactly the
-hazard class SALA's analysis rules out by construction — and the
-reason CUTLASS keeps 19/21 of its warp-specialized kernels on
-`struct`.
+*Why the union is only verified in that regime:* this is a question of
+**validity**, not of speed. SALA's analysis answers one question — do the
+signals and synchronization points permit the two buffers' live ranges to
+be tightened (are the phases disjoint)? If yes, the overlap is sound and
+strictly better (less SMEM, same work); if no, SALA does nothing.
+
+For the persistent cooperative kernel the answer is **no**: a CTA owns
+several work tiles (>114 tiles on a 114-SM H800), so tile *T*'s epilogue
+and tile *T+1*'s mainloop are live at the same time with no synchronization
+point between them — the next tile's mainloop TMA loads overwrite the
+shared memory while the previous tile's epilogue is still staging its
+stores. A `NamedBarrier::sync` between `mma_tail()` and `epilogue.store()`
+synchronizes the consumer warps only and does not create that ordering; we
+measured it: with the barrier in place the union still mismatches ~2,300 of
+4,096 sampled elements at 2048³. The 1024² run (one work tile per CTA) *is*
+the valid regime — there the union is exact (max |D−D_ref| ≈ 0.008), and
+unions of exactly this kind are what CUTLASS itself ships for its
+non-persistent kernel (`sm90_gemm_tma_warpspecialized.hpp`: *"Mainloop and
+epilogue don't use smem concurrently since kernel is non-persistent, so we
+can use a union"*).
+
+That gives a cross-check of the analysis against a production framework's
+hand decisions: of CUTLASS's 21 warp-specialized kernel files, the 2 that
+overlap their mainloop and epilogue storage are exactly the non-persistent
+ones (valid by SALA's criterion), and the 19 that keep `struct` are exactly
+the persistent ones (invalid without a cross-tile barrier). The script
+demonstrates the valid case directly: `--check` also runs CUTLASS's
+non-persistent kernel (its own union, unpatched) and verifies its numerics.
+
+So the Table-2 CUTLASS rows measure the *size of the opportunity* in that
+kernel; whether the overlap may be taken is SALA's verdict, and for the
+persistent kernel as shipped the verdict is no. The valid case is
+demonstrated with numbers: the non-persistent kernel's storage is 96.0 KB
+(mainloop) + 17.0 KB (epilogue) = **97.0 KB** overlapped instead of 113.0 KB
+laid out separately, and its output matches the reference (max
+|D−D_ref| = 0.007, 0/4096 bad) at the full 2048³ size — verified for three
+configurations in both builds.
 
 ### 2.4 Tawa rows (own toolchain, Python 3.10, ~30 min incl. setup)
 

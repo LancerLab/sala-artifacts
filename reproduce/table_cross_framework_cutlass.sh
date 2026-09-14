@@ -98,10 +98,10 @@ echo "Paper values are these ncu measurements rounded to whole KB."
 echo ""
 echo "Numerical verification (sampled fp32 reference, 4096 samples):"
 echo "--- baseline (struct) ---"
-"$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done"
+"$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped"
 b_rc=${PIPESTATUS[0]}
 echo "--- SALA (struct->union) ---"
-"$WORK/cutlass_union_test_sala" --check 2>&1 | grep -E "Reference|Result|Done"
+"$WORK/cutlass_union_test_sala" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped"
 s_rc=${PIPESTATUS[0]}
 if [[ $b_rc -ne 0 || $s_rc -ne 0 ]]; then
     echo "ERROR: numerical verification failed (baseline rc=$b_rc, union rc=$s_rc)"
