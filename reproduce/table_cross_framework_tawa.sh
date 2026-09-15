@@ -24,6 +24,13 @@
 # compiler-requested size with `*` — this is exactly the paper's `*` meaning
 # (compiler-reported) on the "FA WS 3s 258* -> 230" row.
 #
+# After the SMEM rows the script verifies numerics and exits nonzero on
+# mismatch: the GEMM rows against a fp32 torch matmul reference (rel. err
+# < 5 %), the FMHA rows against a fp32 causal-attention reference.  FMHA runs
+# with --membar 1 (the cross-tile mbarrier the SALA overlap requires; without
+# it the 3-stage kernel races -- see README section 2.4).  The 3-stage
+# baseline cannot launch, so only its SALA side is checked.
+#
 # Usage: GPU=0 bash reproduce/table_cross_framework_tawa.sh
 set -euo pipefail
 

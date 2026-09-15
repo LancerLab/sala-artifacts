@@ -7,9 +7,14 @@
 #              (benchmarks/cutlass/patches/sala_union.patch)
 # then ncu-measures launch__shared_mem_per_block_dynamic for both.
 #
-# The patch is the paper's CUTLASS modification (paper.tex: "struct->union +
-# NamedBarrier::sync"): the phase-disjoint mainloop/epilogue tensor storages
-# become a union (max instead of sum).
+# The patch is the manual workaround the paper describes (struct->union): the
+# mainloop and epilogue tensor storages become a union (max instead of sum).
+# It adds no synchronization of its own -- README section 2.3 states when the
+# overlap is valid (one work tile per CTA) and why the persistent multi-tile
+# assignment would additionally need producer-side gating.
+#
+# Step 4 verifies the numerics of both builds (sampled fp32 reference) and
+# exits nonzero on mismatch.
 #
 # Usage: GPU=0 bash reproduce/table_cross_framework_cutlass.sh
 set -euo pipefail
@@ -41,13 +46,13 @@ echo " GPU: $GPU"
 echo "================================================================"
 
 # ---- 1. Baseline binary (pristine v4.5.0 headers) ----
-echo "[1/3] Building baseline (struct) ..."
+echo "[1/4] Building baseline (struct) ..."
 nvcc -std=c++17 -arch=sm_90a -O2 \
     -I "$BASE_INC/include" -I "$UTIL_INC" \
     "$SRC" -o "$WORK/cutlass_union_test_baseline"
 
 # ---- 2. SALA binary (patched header copy) ----
-echo "[2/3] Building SALA (struct->union) ..."
+echo "[2/4] Building SALA (struct->union) ..."
 rm -rf "$WORK/cutlass_sala_include"
 mkdir -p "$WORK/cutlass_sala_include"
 cp -r "$BASE_INC/." "$WORK/cutlass_sala_include/"
@@ -57,7 +62,7 @@ nvcc -std=c++17 -arch=sm_90a -O2 \
     "$SRC" -o "$WORK/cutlass_union_test_sala"
 
 # ---- 3. ncu both binaries (5 kernels each, in CONFIGS order) ----
-echo "[3/3] ncu measuring ..."
+echo "[3/4] ncu measuring ..."
 mapfile -t base_smem < <(CUDA_VISIBLE_DEVICES=$GPU ncu --metrics $NCU_METRIC \
     "$WORK/cutlass_union_test_baseline" 2>&1 \
     | grep "$NCU_METRIC" | grep -oP '[0-9]+\.[0-9]+')
@@ -96,7 +101,7 @@ echo "Paper values are these ncu measurements rounded to whole KB."
 # (see the README section 2.3).  So the union is verified at 1024^2, where
 # every CTA gets one work tile, and the 2048^3 union run reports NOT CHECKED.
 echo ""
-echo "Numerical verification (sampled fp32 reference, 4096 samples):"
+echo "[4/4] numerical verification (sampled fp32 reference, 4096 samples):"
 echo "--- baseline (struct) ---"
 "$WORK/cutlass_union_test_baseline" --check 2>&1 | grep -E "Reference|Result|Done|Non-persistent|overlapped"
 b_rc=${PIPESTATUS[0]}
