@@ -290,6 +290,29 @@ correctness, not a regression against a valid baseline). No paper claim
 depends on Tawa timing — its rows are SMEM/occupancy measurements, both
 unchanged by the barrier.
 
+**Prototype scope of the Tawa pass.** The fork's SALA pass is a ~50-LOC
+prototype of the interference refinement, not the production analysis
+(XComp, §0): it treats aref pipeline buffers and non-aref warp-group
+buffers as phase-disjoint and compacts the latter to offset 0. Two limits
+matter if you reuse it:
+
+- The cross-tile `bar.sync` it inserts covers the loop shapes it
+  recognizes (`WarpGroupOp > for > for`, i.e. the GEMM kernels), and the
+  thread count it emits assumes the 2 × 128-thread warp-group split — the
+  `num_warps=4` used by the rows above. Any other `num_warps` (2, 8, …)
+  leaves the barrier incomplete and the kernel **hangs**; recompile the
+  fork for your warp count (or use the production analysis) before
+  reusing those kernels with different geometry.
+- The FMHA kernel's cross-tile synchronization comes from the kernel's
+  own mbarrier protocol (`--membar 1`), not from the pass — see above.
+  The pass inserts nothing for that loop shape, and the analysis does not
+  verify the yield-point barrier; it is a precondition the kernel
+  template supplies.
+
+`SALA_NO_BARRIER=1` disables the inserted barrier. It is a diagnostic
+switch that deliberately produces unsound kernels (it is how the FMHA
+hazard above was demonstrated) — do not use it for measurements.
+
 The script also checks the FMHA outputs against a **fp32 torch causal
 reference** (2 % + 2 % tolerance, `--check`) for both stages and both
 modes and exits nonzero on mismatch — max |o − ref| ≈ 0.001. The
@@ -478,6 +501,12 @@ explicitly rather than printing a blanket verdict:
   persistent scheduling, which the manual workaround does not
   implement (§2.3). The SMEM numbers are unaffected by this: they are
   a property of the kernel, not of the work assignment.
+- **Tawa prototype scope**: the vendored pass is a prototype of the
+  interference refinement (`~50 LOC`), not the production analysis; its
+  inserted cross-tile barrier covers the GEMM loop shapes at
+  `num_warps=4` (other warp counts hang — recompile for your geometry),
+  and the FMHA row's synchronization comes from the kernel's mbarrier
+  protocol (`--membar 1`). See §2.4.
 - **Tawa rows**: SMEM measurements via `ncu`. The **FMHA** outputs are
   additionally checked against a fp32 torch reference in both stages
   and both modes (2 % + 2 % tolerance; the 3-stage baseline cannot
