@@ -518,22 +518,25 @@ explicitly rather than printing a blanket verdict:
 
 ### 6.4 H100 vs H800: which numbers move
 
-The paper's measurements are from an **H800** (PCIe). Two Table-3 /
-Figure-3 quantities are machine-sensitive, and the artifact documents
-them so a reviewer on an H100 can interpret their own numbers:
+The paper's measurements are from an **H800** (PCIe); all of our own
+measurements are H800-only. Two Table-3 / Figure-3 quantities are
+machine-sensitive, and the artifact documents them so a reviewer on an
+H100 can interpret their own numbers:
 
 - **Act. (`sm__warps_active`) for 1P1C-3s**: 14.2→20.4 % on the H800;
-  on an H100 reviewers have measured ≈17.2–17.6 % for the SALA side.
+  H100 measurements reported to us are ≈17.2–17.6 % for the SALA side.
   The direction and the occupancy step (2→3 CTAs/SM) are what the
   claim rests on; the absolute warp-active percentage depends on the
   SM's warp-slot budget and clock behaviour.
-- **Figure-3 ratio for 1P1C-3s**: ~1.00× on the H800; on an H100 the
-  same kernel can gain ~9–10 % (1.095–1.103×) because the 3-stage
-  config sits at the 2→3 CTA/SM boundary and the H100's higher
-  per-SM issue capacity makes the extra CTA count for more. The
-  paper's claim for that row is "flat (≈1.00×)" on the measured
-  machine; the 1P1C-4s rows (1.34–1.40×) are the headline gains and
-  reproduce on both.
+- **Figure-3 ratio for 1P1C-3s**: flat-to-slightly-regressed on H100s
+  (±~5 %), occupancy/machine-dependent. On our H800 it is ~1.00×
+  (repeated runs of the shipped script give 0.99–1.04×); H100
+  measurements reported to us range from a mild regression
+  (0.95–0.96×) to a ~1.10× gain — treat this row as flat, not as a
+  gain. The occupancy step (2→3 CTAs/SM: 91.1→74.8 KB against
+  228 KB/SM, registers permitting 3) reproduces on both parts. The
+  1P1C-4s rows (1.34–1.40×) are the headline gains and reproduce on
+  both.
 
 ### 6.5 Measurement methodology (trials, order, variability)
 
